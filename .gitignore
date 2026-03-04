@@ -1,0 +1,5 @@
+output
+experiments
+.claude
+.vscode
+__pycache__
