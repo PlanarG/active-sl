@@ -36,28 +36,31 @@ class LBFGSBFitter:
         n_params: int,
         theta0: Optional[np.ndarray] = None,
         bounds: Optional[List[Tuple[float, float]]] = None,
+        theta0s: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
-        rng = np.random.default_rng(self.seed)
+        # Build starting-point list.
+        # theta0s (external list) takes priority; otherwise use theta0 + random restarts.
+        if theta0s is not None:
+            starts = [np.asarray(t, dtype=np.float64) for t in theta0s]
+        else:
+            rng = np.random.default_rng(self.seed)
+            starts = []
+            if theta0 is not None:
+                starts.append(theta0.copy())
+            while len(starts) < self.n_restarts:
+                starts.append(_random_within_bounds(rng, n_params, bounds))
+
         best_theta = None
         best_loss = np.inf
-
         multi_output = y.ndim == 2
 
         def objective(theta_flat):
             theta_2d = theta_flat.reshape(1, -1)
             pred = model_fn(theta_2d, X)
-            if multi_output:
-                residuals = (pred - y).ravel()
-            else:
-                residuals = pred - y
+            residuals = (pred - y).ravel() if multi_output else pred - y
             return float(np.sum(residuals ** 2))
 
-        for i in range(self.n_restarts):
-            if i == 0 and theta0 is not None:
-                x0 = theta0.copy()
-            else:
-                x0 = _random_within_bounds(rng, n_params, bounds)
-
+        for x0 in starts:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 try:
@@ -75,6 +78,7 @@ class LBFGSBFitter:
                     continue
 
         if best_theta is None:
+            rng = np.random.default_rng(self.seed)
             return _random_within_bounds(rng, n_params, bounds)
         return best_theta
 
@@ -95,26 +99,28 @@ class LMFitter:
         n_params: int,
         theta0: Optional[np.ndarray] = None,
         bounds: Optional[List[Tuple[float, float]]] = None,
+        theta0s: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
-        rng = np.random.default_rng(self.seed)
+        if theta0s is not None:
+            starts = [np.asarray(t, dtype=np.float64) for t in theta0s]
+        else:
+            rng = np.random.default_rng(self.seed)
+            starts = []
+            if theta0 is not None:
+                starts.append(theta0.copy())
+            while len(starts) < self.n_restarts:
+                starts.append(_random_within_bounds(rng, n_params, bounds))
+
         best_theta = None
         best_cost = np.inf
-
         multi_output = y.ndim == 2
 
         def residuals_fn(theta_flat):
             theta_2d = theta_flat.reshape(1, -1)
             pred = model_fn(theta_2d, X)
-            if multi_output:
-                return (pred - y).ravel()
-            return pred - y
+            return (pred - y).ravel() if multi_output else pred - y
 
-        for i in range(self.n_restarts):
-            if i == 0 and theta0 is not None:
-                x0 = theta0.copy()
-            else:
-                x0 = _random_within_bounds(rng, n_params, bounds)
-
+        for x0 in starts:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 try:
@@ -131,6 +137,7 @@ class LMFitter:
                     continue
 
         if best_theta is None:
+            rng = np.random.default_rng(self.seed)
             return _random_within_bounds(rng, n_params, bounds)
         return best_theta
 

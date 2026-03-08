@@ -26,7 +26,7 @@ class _ModelFn:
 
     def __call__(self, theta, X):
         self._resolve()
-        return self._fn(theta, X, backend="jax")
+        return self._fn(theta, X, backend="numpy")
 
     def __getstate__(self):
         return {"dataset_name": self.dataset_name, "sl_id": self.sl_id}

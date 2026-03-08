@@ -45,33 +45,32 @@ def _inverse_cost_fallback(state, affordable_candidates, affordable_costs):
     idx = state.rng.choice(len(affordable_candidates), p=probs)
     return np.array([affordable_candidates[idx]])
 
+def _jac_batch_fd(model_fn, theta, X, eps=1e-5):
+    """Finite-difference Jacobians for all rows of X.  Returns (M, D, P)."""
+    n_p = len(theta)
+    partials = []
+    for i in range(n_p):
+        tp = theta.copy(); tp[i] += eps
+        tm = theta.copy(); tm[i] -= eps
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            fp = np.asarray(model_fn(tp.reshape(1, -1), X), dtype=np.float64)
+            fm = np.asarray(model_fn(tm.reshape(1, -1), X), dtype=np.float64)
+        partials.append((fp - fm) / (2.0 * eps))
+    stacked = np.stack(partials, axis=-1)       # (M, P) or (M, D, P)
+    if stacked.ndim == 2:
+        stacked = stacked[:, np.newaxis, :]     # (M, 1, P)
+    return np.where(np.isfinite(stacked), stacked, 0.0)
+
+
+# Cache of JIT-compiled forward-mode Jacobian functions, keyed by model identity.
+# jacfwd needs P JVPs (one per parameter); jacobian (reverse) needs M*D VJPs.
+# Since P << M, forward-mode is much faster for this problem.
+
+
+
 def _jac_batch(model_fn, theta, X, eps=1e-5):
-    """Autodiff Jacobians (JAX then PyTorch); falls back to finite differences.
-
-    Returns array of shape (M, D, P):
-        M = number of training points
-        D = output dimension (1 for scalar models)
-        P = number of parameters
-    """
-    import jax
-    import jax.numpy as jnp
-    jax.config.update("jax_enable_x64", True)
-
-    th = jnp.array(theta, dtype=jnp.float64)
-    Xj = jnp.array(X, dtype=jnp.float64)
-
-    def f(th_):
-        out = model_fn(th_[None, :], Xj)
-        out = jnp.asarray(out, dtype=jnp.float64)
-        if out.ndim == 1:
-            out = out[:, None]          # (M,) → (M, 1)
-        return out                      # (M, D)
-
-    J = jax.jacobian(f)(th)             # (M, D, P)
-    J = np.asarray(J, dtype=np.float64)
-    if J.ndim == 2:
-        J = J[:, np.newaxis, :]
-    return np.where(np.isfinite(J), J, 0.0)
+    """Compute Jacobians for all rows of X via finite differences.  Returns (M, D, P)."""
+    return _jac_batch_fd(model_fn, theta, X, eps)
 
 def _build_fim(jac_all, sel_idx, n_p, reg=1e-6, inv_s2=1.0):
     """FIM = reg*I + inv_s2 * sum J_i^T J_i."""
@@ -193,9 +192,9 @@ class EnsembleDOptMethod:
         sigma2: float = 0.01,
         reg: float = 1e-6,
         jac_eps: float = 1e-5,
-        phase1_steps: int = 7,
+        phase1_steps: int = 10,
         phase2_steps: int = 50,
-        k_init: int = 5,
+        k_init: int = 20,
         k_ens: int = 5,
         k_ens_late: int = 3,
         n_lookahead: int = 5,

@@ -5,12 +5,11 @@ from typing import Dict, List
 
 import numpy as np
 
-from benchmark.metrics import r_squared, mse, auc_r2, budget_to_reach
+from benchmark.metrics import r_squared, mse, auc_r2, log_auc_r2
 from benchmark.method import SelectionState
 from benchmark.task import ScalingLawTask
 
 BUDGET_CHECKPOINTS = np.logspace(np.log10(0.0001), np.log10(1.0), 10).tolist()
-ALPHA_LEVELS = np.logspace(np.log10(0.0001), np.log10(10.0), 10).tolist()
 
 
 @dataclass
@@ -20,9 +19,7 @@ class RunResult:
     r2_at_checkpoints: Dict[float, float]
     mse_at_checkpoints: Dict[float, float]
     auc: float
-    oracle_r2: float
-    oracle_mse: float
-    budget_to_reach_values: Dict[float, float]
+    log_auc: float
 
 
 def _init_state(task: ScalingLawTask, seed: int) -> SelectionState:
@@ -90,20 +87,32 @@ def run_single(
             mask = np.isin(state.candidate_indices, selected, invert=True)
             state.candidate_indices = state.candidate_indices[mask]
 
-        if len(state.observed_indices) < task.n_params:
-            r2_val = -1.0
-            mse_val = float("inf")
-        else:
+        # Fit only at checkpoint
+        if len(state.observed_indices) >= task.n_params:
             obs_idx = state.observed_indices.astype(int)
             X_obs = task.X_train[obs_idx]
             y_obs = task.y_train[obs_idx]
+            n_random = max(fitter.n_restarts - 1, 1)
+            theta0s = []
+            if state.current_theta is not None:
+                theta0s.append(state.current_theta.copy())
+            bounds = task.param_bounds
+            lo = np.array([b[0] for b in bounds], dtype=np.float64)
+            hi = np.array([b[1] for b in bounds], dtype=np.float64)
+            for _ in range(n_random):
+                theta0s.append(lo + (hi - lo) * state.rng.random(task.n_params))
             theta = fitter.fit(
                 task.model_fn, X_obs, y_obs, task.n_params,
-                theta0=state.current_theta,
-                bounds=task.param_bounds,
+                bounds=task.param_bounds, theta0s=theta0s,
             )
             state.current_theta = theta
-            r2_val, mse_val = _evaluate(task, theta)
+
+        # Evaluate at checkpoint
+        if state.current_theta is None or len(state.observed_indices) < task.n_params:
+            r2_val = -1.0
+            mse_val = float("inf")
+        else:
+            r2_val, mse_val = _evaluate(task, state.current_theta)
 
         r2_at_checkpoints[checkpoint] = r2_val
         mse_at_checkpoints[checkpoint] = mse_val
@@ -111,18 +120,10 @@ def run_single(
         checkpoint_r2_vals.append(r2_val)
         checkpoint_mse_vals.append(mse_val)
 
-    # Oracle: use the result at budget fraction 1.0 (last checkpoint)
-    oracle_r2_val = checkpoint_r2_vals[-1]
-    oracle_mse_val = checkpoint_mse_vals[-1]
-
     fracs = np.array(checkpoint_fracs)
     r2_vals = np.array(checkpoint_r2_vals)
-    mse_vals = np.array(checkpoint_mse_vals)
     auc_val = auc_r2(fracs, r2_vals)
-
-    btr = {}
-    for alpha in ALPHA_LEVELS:
-        btr[alpha] = budget_to_reach(fracs, mse_vals, oracle_mse_val, alpha)
+    log_auc_val = log_auc_r2(r2_vals)
 
     return RunResult(
         task_id=task.task_id,
@@ -130,9 +131,7 @@ def run_single(
         r2_at_checkpoints=r2_at_checkpoints,
         mse_at_checkpoints=mse_at_checkpoints,
         auc=auc_val,
-        oracle_r2=oracle_r2_val,
-        oracle_mse=oracle_mse_val,
-        budget_to_reach_values=btr,
+        log_auc=log_auc_val,
     )
 
 
