@@ -437,11 +437,27 @@ class EnsembleDOptMethod:
         return np.array([aff_cand[best_pos]])
 
 
+# ── GreedyCheapestMethod ─────────────────────────────────────────────────────
+
+class GreedyCheapestMethod:
+    """Always select the cheapest affordable candidate (ties broken randomly)."""
+
+    def propose(self, state: SelectionState) -> np.ndarray:
+        aff_cand, aff_costs = _affordable_candidates(state)
+        if len(aff_cand) == 0:
+            return np.array([], dtype=int)
+        min_cost = aff_costs.min()
+        ties = np.where(np.abs(aff_costs - min_cost) < 1e-12)[0]
+        idx = state.rng.choice(ties)
+        return np.array([aff_cand[idx]])
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 METHOD_REGISTRY = {
     "random": RandomMethod,
     "inverse_cost": InverseCostMethod,
+    "greedy_cheapest": GreedyCheapestMethod,
     "fim": FIMMethod,
     "ensemble_dopt": EnsembleDOptMethod,
 }
