@@ -1,4 +1,4 @@
-"""Task loading: enumerate (dataset, group, sl_id) triples."""
+"""Task loading: enumerate (dataset, sl_id) pairs with per-group data."""
 
 from dataclasses import dataclass
 from importlib import import_module
@@ -38,16 +38,22 @@ class _ModelFn:
 
 
 @dataclass
-class ScalingLawTask:
-    task_id: str
-    dataset_name: str
+class GroupData:
+    """Data for a single group within a task."""
     group: str
-    sl_id: str
     X_train: np.ndarray
     y_train: np.ndarray
     X_test: np.ndarray
     y_test: np.ndarray
     cost_train: np.ndarray
+
+
+@dataclass
+class ScalingLawTask:
+    task_id: str           # "dataset/sl_id"
+    dataset_name: str
+    sl_id: str
+    groups: List[GroupData]
     model_fn: Callable
     n_params: int
     param_bounds: Optional[List] = None
@@ -80,9 +86,9 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
     else:
         groups = ["all_data"]
 
-    tasks = []
+    # Build per-group data
+    group_data_list = []
     for group in groups:
-        # Filter by group
         if info.group_col in train_data:
             train_mask = [i for i, g in enumerate(train_data[info.group_col]) if g == group]
             test_mask = [i for i, g in enumerate(test_data[info.group_col]) if g == group]
@@ -93,7 +99,6 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
         if len(train_mask) == 0 or len(test_mask) == 0:
             continue
 
-        # Build X arrays
         X_train = np.array(
             [[train_data[c][i] for c in info.feature_cols] for i in train_mask],
             dtype=np.float64,
@@ -102,8 +107,6 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
             [[test_data[c][i] for c in info.feature_cols] for i in test_mask],
             dtype=np.float64,
         )
-
-        # Build y arrays
         y_train = np.array(
             [[train_data[c][i] for c in info.target_cols] for i in train_mask],
             dtype=np.float64,
@@ -112,12 +115,10 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
             [[test_data[c][i] for c in info.target_cols] for i in test_mask],
             dtype=np.float64,
         )
-        # Squeeze single-target to 1D
         if y_train.shape[1] == 1:
             y_train = y_train[:, 0]
             y_test = y_test[:, 0]
 
-        # Compute per-point cost
         all_cols = info.feature_cols + info.target_cols + info.cost_extra_cols
         if info.group_col in train_data:
             all_cols = list(dict.fromkeys([info.group_col] + all_cols))
@@ -126,24 +127,30 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
             dtype=np.float64,
         )
 
-        for sl_id in law_registry:
-            n_p = param_counts[sl_id]
-            bounds = param_bounds.get(sl_id, None)
-            task = ScalingLawTask(
-                task_id=f"{dataset_name}/{group}/{sl_id}",
-                dataset_name=dataset_name,
-                group=group,
-                sl_id=sl_id,
-                X_train=X_train,
-                y_train=y_train,
-                X_test=X_test,
-                y_test=y_test,
-                cost_train=cost_train,
-                model_fn=_ModelFn(dataset_name, sl_id),
-                n_params=n_p,
-                param_bounds=bounds,
-            )
-            tasks.append(task)
+        group_data_list.append(GroupData(
+            group=str(group),
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            cost_train=cost_train,
+        ))
+
+    # Create one task per sl_id, containing all groups
+    tasks = []
+    for sl_id in law_registry:
+        n_p = param_counts[sl_id]
+        bounds = param_bounds.get(sl_id, None)
+        task = ScalingLawTask(
+            task_id=f"{dataset_name}/{sl_id}",
+            dataset_name=dataset_name,
+            sl_id=sl_id,
+            groups=group_data_list,
+            model_fn=_ModelFn(dataset_name, sl_id),
+            n_params=n_p,
+            param_bounds=bounds,
+        )
+        tasks.append(task)
 
     return tasks
 

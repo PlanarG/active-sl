@@ -5,9 +5,9 @@ from typing import Dict, List
 
 import numpy as np
 
-from benchmark.metrics import r_squared, mse, auc_r2, log_auc_r2
+from benchmark.metrics import r_squared, log_auc_r2
 from benchmark.method import SelectionState
-from benchmark.task import ScalingLawTask
+from benchmark.task import ScalingLawTask, GroupData
 
 BUDGET_CHECKPOINTS = np.logspace(np.log10(0.0001), np.log10(1.0), 10).tolist()
 
@@ -17,47 +17,58 @@ class RunResult:
     task_id: str
     seed: int
     r2_at_checkpoints: Dict[float, float]
-    mse_at_checkpoints: Dict[float, float]
-    auc: float
     log_auc: float
 
 
-def _init_state(task: ScalingLawTask, seed: int) -> SelectionState:
+def _init_state(gd: GroupData, task: ScalingLawTask, seed: int) -> SelectionState:
     rng = np.random.default_rng(seed)
-    n_train = task.X_train.shape[0]
-    total_cost = float(np.sum(task.cost_train))
+    n_train = gd.X_train.shape[0]
+    total_cost = float(np.sum(gd.cost_train))
     return SelectionState(
         candidate_indices=np.arange(n_train),
         observed_indices=np.array([], dtype=int),
         current_theta=None,
         spent_budget=0.0,
         total_budget=total_cost,
-        cost_per_point=task.cost_train,
+        cost_per_point=gd.cost_train,
         rng=rng,
-        X_train=task.X_train,
+        X_train=gd.X_train,
         model_fn=task.model_fn,
         n_params=task.n_params,
         param_bounds=task.param_bounds,
     )
 
 
-def _evaluate(task: ScalingLawTask, theta: np.ndarray) -> tuple:
-    """Compute test R² and MSE. Returns (-1.0, inf) on numerical failure."""
-    theta_2d = theta.reshape(1, -1)
-    try:
-        pred = task.model_fn(theta_2d, task.X_test)
-        pred_arr = np.asarray(pred, dtype=np.float64)
-        if not np.all(np.isfinite(pred_arr)):
-            return -1.0, float("inf")
-        r2_val = r_squared(task.y_test, pred)
-        mse_val = mse(task.y_test, pred)
-        if not np.isfinite(r2_val):
-            r2_val = -1.0
-        if not np.isfinite(mse_val):
-            mse_val = float("inf")
-        return r2_val, mse_val
-    except Exception:
-        return -1.0, float("inf")
+def _evaluate_global(task: ScalingLawTask, group_thetas: Dict[str, np.ndarray]) -> float:
+    """Compute global R² by concatenating predictions across all groups.
+
+    Groups without a valid theta contribute predictions of NaN and are excluded.
+    Returns -1.0 on failure.
+    """
+    all_pred = []
+    all_true = []
+    for gd in task.groups:
+        theta = group_thetas.get(gd.group)
+        if theta is None:
+            continue
+        theta_2d = theta.reshape(1, -1)
+        try:
+            pred = task.model_fn(theta_2d, gd.X_test)
+            pred_arr = np.asarray(pred, dtype=np.float64)
+            if not np.all(np.isfinite(pred_arr)):
+                continue
+            all_pred.append(pred_arr.ravel())
+            all_true.append(np.asarray(gd.y_test, dtype=np.float64).ravel())
+        except Exception:
+            continue
+
+    if len(all_pred) == 0:
+        return -1.0
+
+    pred_cat = np.concatenate(all_pred)
+    true_cat = np.concatenate(all_true)
+    r2 = r_squared(true_cat, pred_cat)
+    return r2 if np.isfinite(r2) else -1.0
 
 
 def run_single(
@@ -66,32 +77,40 @@ def run_single(
     fitter,
     seed: int,
 ) -> RunResult:
-    state = _init_state(task, seed)
-    total_cost = state.total_budget
+    # Use different seed per group to avoid correlated randomness
+    base_seed = seed * 100_000
+    states = {}
+    for i, gd in enumerate(task.groups):
+        states[gd.group] = _init_state(gd, task, base_seed + i)
 
     r2_at_checkpoints = {}
-    mse_at_checkpoints = {}
-    checkpoint_fracs = []
     checkpoint_r2_vals = []
-    checkpoint_mse_vals = []
 
     for checkpoint in BUDGET_CHECKPOINTS:
-        target = checkpoint * total_cost
-        while state.spent_budget < target - 1e-12 and len(state.candidate_indices) > 0:
-            selected = method.propose(state)
-            if len(selected) == 0:
-                break
-            for idx in selected:
-                state.spent_budget += state.cost_per_point[idx]
-            state.observed_indices = np.concatenate([state.observed_indices, selected])
-            mask = np.isin(state.candidate_indices, selected, invert=True)
-            state.candidate_indices = state.candidate_indices[mask]
+        group_thetas = {}
 
-        # Fit only at checkpoint
-        if len(state.observed_indices) >= task.n_params:
+        for gd in task.groups:
+            state = states[gd.group]
+            target = checkpoint * state.total_budget
+
+            # Selection phase
+            while state.spent_budget < target - 1e-12 and len(state.candidate_indices) > 0:
+                selected = method.propose(state)
+                if len(selected) == 0:
+                    break
+                for idx in selected:
+                    state.spent_budget += state.cost_per_point[idx]
+                state.observed_indices = np.concatenate([state.observed_indices, selected])
+                mask = np.isin(state.candidate_indices, selected, invert=True)
+                state.candidate_indices = state.candidate_indices[mask]
+
+            # Fitting phase
             obs_idx = state.observed_indices.astype(int)
-            X_obs = task.X_train[obs_idx]
-            y_obs = task.y_train[obs_idx]
+            if len(obs_idx) < task.n_params:
+                continue
+
+            X_obs = gd.X_train[obs_idx]
+            y_obs = gd.y_train[obs_idx]
             n_random = max(fitter.n_restarts - 1, 1)
             theta0s = []
             if state.current_theta is not None:
@@ -106,31 +125,20 @@ def run_single(
                 bounds=task.param_bounds, theta0s=theta0s,
             )
             state.current_theta = theta
+            group_thetas[gd.group] = theta
 
-        # Evaluate at checkpoint
-        if state.current_theta is None or len(state.observed_indices) < task.n_params:
-            r2_val = -1.0
-            mse_val = float("inf")
-        else:
-            r2_val, mse_val = _evaluate(task, state.current_theta)
-
+        # Global evaluation across all groups
+        r2_val = _evaluate_global(task, group_thetas)
         r2_at_checkpoints[checkpoint] = r2_val
-        mse_at_checkpoints[checkpoint] = mse_val
-        checkpoint_fracs.append(checkpoint)
         checkpoint_r2_vals.append(r2_val)
-        checkpoint_mse_vals.append(mse_val)
 
-    fracs = np.array(checkpoint_fracs)
     r2_vals = np.array(checkpoint_r2_vals)
-    auc_val = auc_r2(fracs, r2_vals)
     log_auc_val = log_auc_r2(r2_vals)
 
     return RunResult(
         task_id=task.task_id,
         seed=seed,
         r2_at_checkpoints=r2_at_checkpoints,
-        mse_at_checkpoints=mse_at_checkpoints,
-        auc=auc_val,
         log_auc=log_auc_val,
     )
 
