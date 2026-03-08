@@ -45,8 +45,24 @@ def _cost_domain_mixture(row: dict) -> float:
     return 1.0
 
 
+def _cost_chinchilla(row: dict) -> float:
+    return 6.0 * float(row["N"]) * float(row["D"])
+
+
 def _cost_sft(row: dict) -> float:
     return float(row["sft_data_size"])
+
+
+def _cost_sae(row: dict) -> float:
+    return float(row["n"]) ** 1.6
+
+
+def _cost_distillation(row: dict) -> float:
+    return 6.0 * float(row["NS"]) * float(row["DS"])
+
+
+def _cost_sparsity(row: dict) -> float:
+    return 6.0 * row["N_dense"] * row["D1"] + 6.0 * row["N_active"] * row["D2"]
 
 
 DATASET_REGISTRY: Dict[str, DatasetInfo] = {
@@ -105,11 +121,36 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         ],
         cost_fn=_cost_domain_mixture,
     ),
+    "chinchilla_scaling_law": DatasetInfo(
+        name="chinchilla_scaling_law",
+        feature_cols=["N", "D"],
+        target_cols=["loss"],
+        cost_fn=_cost_chinchilla,
+    ),
     "sft_scaling_law": DatasetInfo(
         name="sft_scaling_law",
         feature_cols=["sft_data_size"],
         target_cols=["sft_loss"],
         cost_fn=_cost_sft,
+    ),
+    "sae_scaling_law": DatasetInfo(
+        name="sae_scaling_law",
+        feature_cols=["n", "k"],
+        target_cols=["loss"],
+        cost_fn=_cost_sae,
+    ),
+    "distillation_scaling_law": DatasetInfo(
+        name="distillation_scaling_law",
+        feature_cols=["NS", "DS", "LT"],
+        target_cols=["LS"],
+        cost_fn=_cost_distillation,
+    ),
+    "sparsity_scaling_law": DatasetInfo(
+        name="sparsity_scaling_law",
+        feature_cols=["P", "N_active"],
+        target_cols=["loss"],
+        cost_fn=_cost_sparsity,
+        cost_extra_cols=["N_dense", "D1", "D2"],
     ),
 }
 

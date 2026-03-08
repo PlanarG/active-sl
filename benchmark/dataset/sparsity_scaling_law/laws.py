@@ -1,0 +1,138 @@
+"""Scaling laws for MoE sparsity models.
+
+X columns: [P (= N_total / N_active), N_active]
+
+sl_1 (5 params): L = exp(d1) * P^(-a) * N_active^(-b) * exp(c * log(P) * log(N_active)) + exp(d3)
+sl_2 (4 params): L = exp(d1) * P^(-a) * N_active^(-b) + exp(d3)
+sl_3 (6 params): L = exp(d1) * P^(-a) + exp(d2) * N_active^(-b) * exp(c * log(P) * log(N_active)) + exp(d3)
+sl_4 (5 params): L = exp(d1) * P^(-a) + exp(d2) * N_active^(-b) + exp(d3)
+"""
+
+from typing import Literal
+
+import benchmark.dataset.utils as utils
+
+_EPS = 1e-12
+
+
+# sl_1 (5 params): [d1, a, b, c, d3]
+# L = exp(d1) * P^(-a) * N_active^(-b) * exp(c * log(P) * log(N_active)) + exp(d3)
+def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
+    ops = utils.get_ops(backend)
+    xp = ops.xp
+    X = ops.asarray(X, atleast_2d=True)
+    theta = ops.asarray(theta, atleast_2d=True)
+
+    P = ops.clamp_min(X[:, 0], _EPS)
+    N_act = ops.clamp_min(X[:, 1], _EPS)
+
+    d1 = theta[:, 0]
+    a = theta[:, 1]
+    b = theta[:, 2]
+    c = theta[:, 3]
+    d3 = theta[:, 4]
+
+    log_P = xp.log(P)[None, :]
+    log_N = xp.log(N_act)[None, :]
+
+    term = (
+        ops.exp(d1[:, None])
+        * (P[None, :] ** (-a[:, None]))
+        * (N_act[None, :] ** (-b[:, None]))
+        * ops.exp(c[:, None] * log_P * log_N)
+    )
+    pred = term + ops.exp(d3[:, None])
+    return pred[0] if pred.shape[0] == 1 else pred
+
+
+# sl_2 (4 params): [d1, a, b, d3]
+# L = exp(d1) * P^(-a) * N_active^(-b) + exp(d3)
+def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
+    ops = utils.get_ops(backend)
+    X = ops.asarray(X, atleast_2d=True)
+    theta = ops.asarray(theta, atleast_2d=True)
+
+    P = ops.clamp_min(X[:, 0], _EPS)
+    N_act = ops.clamp_min(X[:, 1], _EPS)
+
+    d1 = theta[:, 0]
+    a = theta[:, 1]
+    b = theta[:, 2]
+    d3 = theta[:, 3]
+
+    term = (
+        ops.exp(d1[:, None])
+        * (P[None, :] ** (-a[:, None]))
+        * (N_act[None, :] ** (-b[:, None]))
+    )
+    pred = term + ops.exp(d3[:, None])
+    return pred[0] if pred.shape[0] == 1 else pred
+
+
+# sl_3 (6 params): [d1, a, d2, b, c, d3]
+# L = exp(d1) * P^(-a) + exp(d2) * N_active^(-b) * exp(c * log(P) * log(N_active)) + exp(d3)
+def sl_3(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
+    ops = utils.get_ops(backend)
+    xp = ops.xp
+    X = ops.asarray(X, atleast_2d=True)
+    theta = ops.asarray(theta, atleast_2d=True)
+
+    P = ops.clamp_min(X[:, 0], _EPS)
+    N_act = ops.clamp_min(X[:, 1], _EPS)
+
+    d1 = theta[:, 0]
+    a = theta[:, 1]
+    d2 = theta[:, 2]
+    b = theta[:, 3]
+    c = theta[:, 4]
+    d3 = theta[:, 5]
+
+    log_P = xp.log(P)[None, :]
+    log_N = xp.log(N_act)[None, :]
+
+    term_P = ops.exp(d1[:, None]) * (P[None, :] ** (-a[:, None]))
+    term_N = (
+        ops.exp(d2[:, None])
+        * (N_act[None, :] ** (-b[:, None]))
+        * ops.exp(c[:, None] * log_P * log_N)
+    )
+    pred = term_P + term_N + ops.exp(d3[:, None])
+    return pred[0] if pred.shape[0] == 1 else pred
+
+
+# sl_4 (5 params): [d1, a, d2, b, d3]
+# L = exp(d1) * P^(-a) + exp(d2) * N_active^(-b) + exp(d3)
+def sl_4(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
+    ops = utils.get_ops(backend)
+    X = ops.asarray(X, atleast_2d=True)
+    theta = ops.asarray(theta, atleast_2d=True)
+
+    P = ops.clamp_min(X[:, 0], _EPS)
+    N_act = ops.clamp_min(X[:, 1], _EPS)
+
+    d1 = theta[:, 0]
+    a = theta[:, 1]
+    d2 = theta[:, 2]
+    b = theta[:, 3]
+    d3 = theta[:, 4]
+
+    term_P = ops.exp(d1[:, None]) * (P[None, :] ** (-a[:, None]))
+    term_N = ops.exp(d2[:, None]) * (N_act[None, :] ** (-b[:, None]))
+    pred = term_P + term_N + ops.exp(d3[:, None])
+    return pred[0] if pred.shape[0] == 1 else pred
+
+
+LAW_REGISTRY = {"sl_1": sl_1, "sl_2": sl_2, "sl_3": sl_3, "sl_4": sl_4}
+PARAM_COUNTS = {"sl_1": 5, "sl_2": 4, "sl_3": 6, "sl_4": 5}
+
+# Data ranges:
+#   P in [1.86, 12.25], N_active in [0.015, 1.90], loss in [2.07, 3.40]
+# d1, d2, d3: inside exp(), so reasonable range is (-5, 5)
+# a, b: positive exponents, (0.01, 3.0)
+# c: cross-term coefficient, (-1, 1)
+PARAM_BOUNDS = {
+    "sl_1": [(-5.0, 5.0), (0.01, 3.0), (0.01, 3.0), (-1.0, 1.0), (-5.0, 5.0)],
+    "sl_2": [(-5.0, 5.0), (0.01, 3.0), (0.01, 3.0), (-5.0, 5.0)],
+    "sl_3": [(-5.0, 5.0), (0.01, 3.0), (-5.0, 5.0), (0.01, 3.0), (-1.0, 1.0), (-5.0, 5.0)],
+    "sl_4": [(-5.0, 5.0), (0.01, 3.0), (-5.0, 5.0), (0.01, 3.0), (-5.0, 5.0)],
+}
