@@ -9,10 +9,10 @@ _EPS = 1e-12
 #   L_S(L_T, N_S, D_S) = L_T + (1 / L_T^c0) * sigmoid_term * power_law_term
 #
 # where:
-#   chinchilla_term = 1.220 + (3355/N_S^0.408 + 18186/D_S^0.431)^0.452
+#   chinchilla_term = 1.220 + (3355/NS^0.408 + 18186/DS^0.431)^0.452
 #   ratio = L_T / (chinchilla_term * d1)
 #   sigmoid_term = (1 + ratio^(1/f1))^(-c1 * f1)
-#   power_law_term = (A'/N_S^alpha' + B'/D_S^beta')^gamma'
+#   power_law_term = (A'/NS^alpha' + B'/DS^beta')^gamma'
 #
 # Fixed constants: 1.220, 3355, 0.408, 18186, 0.431, 0.452
 # Free parameters: [c0, d1, f1, c1, A_prime, alpha_prime, B_prime, beta_prime, gamma_prime]
@@ -21,6 +21,7 @@ _EPS = 1e-12
 # Output: (B, M) or (M,) for single theta
 def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
 
@@ -44,32 +45,86 @@ def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     # L_chinchilla(NS, DS) = 1.220 + (3355/NS^0.408 + 18186/DS^0.431)^0.452
     chinchilla_term = 1.220 + (
         3355.0 / (NS[None, :] ** 0.408) + 18186.0 / (DS[None, :] ** 0.431)
-    ) ** 0.452
+    ) ** 0.452  # (1, M) broadcast to (B, M)
 
     # ratio = LT / (chinchilla_term * d1)
-    ratio = LT[None, :] / ops.clamp_min(chinchilla_term * d1[:, None], _EPS)
+    ratio = LT[None, :] / ops.clamp_min(chinchilla_term * d1[:, None], _EPS)  # (B, M)
 
-    # sigmoid-like term: (1 + ratio^(1/f1))^(-c1*f1)
-    f1_safe = ops.clamp_min(f1[:, None], _EPS)
-    power_inner = ops.clamp_min(ratio, _EPS) ** (1.0 / f1_safe)
-    sigmoid_term = (1.0 + power_inner) ** (-c1[:, None] * f1_safe)
+    # sigmoid-like term: S = (1 + ratio^(1/f1))^(-c1*f1)
+    f1_safe = ops.clamp_min(f1[:, None], _EPS)  # (B, 1)
+    ratio_safe = ops.clamp_min(ratio, _EPS)  # (B, M)
+    u = ratio_safe ** (1.0 / f1_safe)  # ratio^(1/f1), (B, M)
+    one_plus_u = 1.0 + u  # (B, M)
+    S = one_plus_u ** (-c1[:, None] * f1_safe)  # sigmoid_term, (B, M)
 
-    # Power law term: (A'/NS^alpha' + B'/DS^beta')^gamma'
-    power_law = (
-        A_prime[:, None] / ops.clamp_min(NS[None, :] ** alpha_prime[:, None], _EPS)
-        + B_prime[:, None] / ops.clamp_min(DS[None, :] ** beta_prime[:, None], _EPS)
-    )
-    power_law = ops.clamp_min(power_law, _EPS) ** gamma_prime[:, None]
+    # Power law term: W = (A'/NS^alpha' + B'/DS^beta')^gamma'
+    log_NS = xp.log(ops.clamp_min(NS, _EPS))  # (M,)
+    log_DS = xp.log(ops.clamp_min(DS, _EPS))  # (M,)
+    term_NS = A_prime[:, None] / ops.clamp_min(NS[None, :] ** alpha_prime[:, None], _EPS)  # (B, M)
+    term_DS = B_prime[:, None] / ops.clamp_min(DS[None, :] ** beta_prime[:, None], _EPS)   # (B, M)
+    inner = ops.clamp_min(term_NS + term_DS, _EPS)  # (B, M)
+    W = inner ** gamma_prime[:, None]  # power_law, (B, M)
 
-    # Full formula: LT + (1/LT^c0) * sigmoid_term * power_law
-    pred = (
-        LT[None, :]
-        + (1.0 / ops.clamp_min(LT[None, :] ** c0[:, None], _EPS))
-        * sigmoid_term
-        * power_law
-    )
+    # prefix = 1 / LT^c0
+    log_LT = xp.log(ops.clamp_min(LT, _EPS))  # (M,)
+    prefix = 1.0 / ops.clamp_min(LT[None, :] ** c0[:, None], _EPS)  # (B, M)
 
-    return pred[0] if pred.shape[0] == 1 else pred
+    # Full formula: pred = LT + prefix * S * W
+    tail = prefix * S * W  # (B, M)
+    pred = LT[None, :] + tail  # (B, M)
+
+    # ---- Jacobian computation ----
+    # tail = prefix * S * W
+    # pred = LT + tail
+
+    # Shared intermediates for sigmoid derivatives
+    log_ratio = xp.log(ops.clamp_min(ratio_safe, _EPS))  # (B, M)
+    log_one_plus_u = xp.log(ops.clamp_min(one_plus_u, _EPS))  # (B, M)
+    log_inner = xp.log(ops.clamp_min(inner, _EPS))  # (B, M)
+
+    # (1) d/d(c0): prefix = LT^(-c0), d(prefix)/d(c0) = -prefix * log(LT)
+    d_c0 = -tail * log_LT[None, :]
+
+    # (2) d/d(d1): affects ratio = LT/(chin*d1), d(ratio)/d(d1) = -ratio/d1
+    # dS/d(ratio) = S * [-c1 * u / (ratio * (1+u))]   (via log-derivative)
+    # d(pred)/d(d1) = prefix * W * dS/d(ratio) * (-ratio/d1)
+    #              = tail * c1 * u / (d1 * (1+u))
+    d_d1 = tail * c1[:, None] * u / (d1[:, None] * one_plus_u)
+
+    # (3) d/d(f1): S = (1+u)^(-c1*f1), u = ratio^(1/f1)
+    # d(log S)/d(f1) = -c1*log(1+u) + c1*u*log(ratio) / (f1*(1+u))
+    # dS/d(f1) = S * [above]
+    d_f1 = tail * (-c1[:, None] * log_one_plus_u
+                    + c1[:, None] * u * log_ratio / (f1_safe * one_plus_u))
+
+    # (4) d/d(c1): d(log S)/d(c1) = -f1*log(1+u)
+    d_c1 = tail * (-f1_safe * log_one_plus_u)
+
+    # (5) d/d(A_prime): W = inner^gamma', inner = term_NS + term_DS
+    # dW/d(A') = gamma' * inner^(gamma'-1) * NS^(-alpha') = W * gamma' * NS^(-alpha') / inner
+    NS_neg_alpha = term_NS / A_prime[:, None]  # NS^(-alpha'), safe since A_prime in numerator
+    d_A_prime = prefix * S * W * gamma_prime[:, None] * NS_neg_alpha / inner
+
+    # (6) d/d(alpha_prime): d(term_NS)/d(alpha') = -term_NS * log(NS)
+    # dW/d(alpha') = W * gamma' * (-term_NS * log(NS)) / inner
+    d_alpha_prime = prefix * S * W * gamma_prime[:, None] * (-term_NS * log_NS[None, :]) / inner
+
+    # (7) d/d(B_prime): similar to A_prime
+    DS_neg_beta = term_DS / B_prime[:, None]  # DS^(-beta')
+    d_B_prime = prefix * S * W * gamma_prime[:, None] * DS_neg_beta / inner
+
+    # (8) d/d(beta_prime): d(term_DS)/d(beta') = -term_DS * log(DS)
+    d_beta_prime = prefix * S * W * gamma_prime[:, None] * (-term_DS * log_DS[None, :]) / inner
+
+    # (9) d/d(gamma_prime): dW/d(gamma') = W * log(inner)
+    d_gamma_prime = tail * log_inner
+
+    jac = ops.stack([d_c0, d_d1, d_f1, d_c1, d_A_prime, d_alpha_prime,
+                     d_B_prime, d_beta_prime, d_gamma_prime], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # Parameter bounds for sl_1:

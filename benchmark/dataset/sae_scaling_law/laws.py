@@ -46,8 +46,31 @@ def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     exponent2 = zeta[:, None] + eta[:, None] * log_k
     exponent2 = ops.clamp(exponent2, min=-50.0, max=50.0)
 
-    pred = ops.exp(exponent1) + ops.exp(exponent2)
-    return pred[0] if pred.shape[0] == 1 else pred
+    t1 = ops.exp(exponent1)  # (B, M)
+    t2 = ops.exp(exponent2)  # (B, M)
+
+    pred = t1 + t2  # (B, M)
+
+    # Jacobian: (B, M, 6)
+    # t1 = exp(exponent1), so d(t1)/d(param) = t1 * d(exponent1)/d(param)
+    # t2 = exp(exponent2), so d(t2)/d(param) = t2 * d(exponent2)/d(param)
+    # exponent1 = alpha + beta_k*log_k + beta_n*log_n + gamma*log_k*log_n
+    # exponent2 = zeta + eta*log_k
+
+    zeros = pred * 0.0  # (B, M)
+
+    d_alpha = t1                           # d/d_alpha: t1 * 1
+    d_beta_k = t1 * log_k                  # d/d_beta_k: t1 * log_k
+    d_beta_n = t1 * log_n                  # d/d_beta_n: t1 * log_n
+    d_gamma = t1 * log_k * log_n           # d/d_gamma: t1 * log_k * log_n
+    d_zeta = zeros + t2                    # d/d_zeta: t2 * 1
+    d_eta = t2 * log_k                     # d/d_eta: t2 * log_k
+
+    jac = ops.stack([d_alpha, d_beta_k, d_beta_n, d_gamma, d_zeta, d_eta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 LAW_REGISTRY = {"sl_1": sl_1}

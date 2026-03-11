@@ -20,6 +20,7 @@ class SelectionState:
     model_fn: Optional[Callable] = None
     n_params: int = 0
     param_bounds: Optional[list] = None
+    y_train: Optional[np.ndarray] = None
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -45,32 +46,13 @@ def _inverse_cost_fallback(state, affordable_candidates, affordable_costs):
     idx = state.rng.choice(len(affordable_candidates), p=probs)
     return np.array([affordable_candidates[idx]])
 
-def _jac_batch_fd(model_fn, theta, X, eps=1e-5):
-    """Finite-difference Jacobians for all rows of X.  Returns (M, D, P)."""
-    n_p = len(theta)
-    partials = []
-    for i in range(n_p):
-        tp = theta.copy(); tp[i] += eps
-        tm = theta.copy(); tm[i] -= eps
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            fp = np.asarray(model_fn(tp.reshape(1, -1), X), dtype=np.float64)
-            fm = np.asarray(model_fn(tm.reshape(1, -1), X), dtype=np.float64)
-        partials.append((fp - fm) / (2.0 * eps))
-    stacked = np.stack(partials, axis=-1)       # (M, P) or (M, D, P)
-    if stacked.ndim == 2:
-        stacked = stacked[:, np.newaxis, :]     # (M, 1, P)
-    return np.where(np.isfinite(stacked), stacked, 0.0)
-
-
-# Cache of JIT-compiled forward-mode Jacobian functions, keyed by model identity.
-# jacfwd needs P JVPs (one per parameter); jacobian (reverse) needs M*D VJPs.
-# Since P << M, forward-mode is much faster for this problem.
-
-
-
 def _jac_batch(model_fn, theta, X, eps=1e-5):
-    """Compute Jacobians for all rows of X via finite differences.  Returns (M, D, P)."""
-    return _jac_batch_fd(model_fn, theta, X, eps)
+    """Analytical Jacobians for all rows of X.  Returns (M, D, P)."""
+    _, jac = model_fn(theta.reshape(1, -1), X)
+    jac = np.asarray(jac, dtype=np.float64)
+    if jac.ndim == 2:
+        jac = jac[:, np.newaxis, :]     # (M, 1, P)
+    return np.where(np.isfinite(jac), jac, 0.0)
 
 def _build_fim(jac_all, sel_idx, n_p, reg=1e-6, inv_s2=1.0):
     """FIM = reg*I + inv_s2 * sum J_i^T J_i."""
@@ -452,6 +434,120 @@ class GreedyCheapestMethod:
         return np.array([aff_cand[idx]])
 
 
+# ── SLTunerMethod (wraps sltuner.Selector, batch=1, refit every step) ────────
+
+class SLTunerMethod:
+    """Wrap sltuner.Selector with batch=1 and re-fit after every selection."""
+
+    def __init__(self, sigma2=1e-3, num_samples=1024, n_restarts=64, max_workers=16):
+        self.sigma2 = sigma2
+        self.num_samples = num_samples
+        self.n_restarts = n_restarts
+        self.max_workers = max_workers
+
+    def propose(self, state: SelectionState) -> np.ndarray:
+        print("fuck ", state.current_theta, state.spent_budget / state.total_budget)
+        ms = state.method_state
+        aff_cand, aff_costs = _affordable_candidates(state)
+        if len(aff_cand) == 0:
+            return np.array([], dtype=int)
+
+        if "selector" not in ms:
+            ms["selector"] = self._create_selector(state)
+            ms["fitter"] = self._create_fitter()
+
+        selector = ms["selector"]
+        theta_internal = None
+        if state.current_theta is not None:
+            theta_internal = self._to_internal(selector, state.current_theta)
+
+        idx = selector.select(theta=theta_internal, batch=1)
+
+        selected = np.array([idx])
+        print("fuck2")
+
+        # Re-fit immediately after every selection
+        new_observed = np.concatenate(
+            [state.observed_indices, selected]
+        ).astype(int)
+        if len(new_observed) >= state.n_params:
+            theta = self._refit(state, ms["fitter"], new_observed)
+            if theta is not None:
+                state.current_theta = theta
+            
+
+        return selected
+
+    def _create_selector(self, state):
+        from sltuner.parameter import ParameterSpec
+        from sltuner.selector import Selector, Candidate
+
+        parameters = [
+            ParameterSpec(name=f"p{i}", low=lo, high=hi)
+            for i, (lo, hi) in enumerate(state.param_bounds)
+        ]
+        candidates = [
+            Candidate(point=state.X_train[i], cost=float(state.cost_per_point[i]))
+            for i in range(state.X_train.shape[0])
+        ]
+        model_fn = state.model_fn
+
+        def predict_fn(theta_external, data):
+            theta_external = np.atleast_2d(theta_external)
+            S = theta_external.shape[0]
+            pred, jac = model_fn(theta_external, data)
+            pred = np.asarray(pred, dtype=np.float64)
+            jac = np.asarray(jac, dtype=np.float64)
+            if S == 1 and pred.ndim == 1:
+                pred = pred[np.newaxis, :]
+                jac = jac[np.newaxis, :, :]
+            jac = np.where(np.isfinite(jac), jac, 0.0)
+            return pred, jac
+
+        return Selector(
+            parameters=parameters,
+            candidates=candidates,
+            predict_fn=predict_fn,
+            num_samples=self.num_samples,
+            sigma2=self.sigma2,
+            rng=state.rng,
+        )
+
+    def _create_fitter(self):
+        from benchmark.fitter import LBFGSBFitter
+        return LBFGSBFitter(n_restarts=self.n_restarts, max_workers=self.max_workers)
+
+    @staticmethod
+    def _to_internal(selector, theta_external):
+        from sltuner.parameter import Transform
+        internal = np.empty(len(selector.parameters))
+        for j, param in enumerate(selector.parameters):
+            if param.transform == Transform.LOG:
+                internal[j] = np.log(theta_external[j])
+            else:
+                internal[j] = theta_external[j]
+        return internal
+
+    def _refit(self, state, fitter, observed_indices):
+        X_obs = state.X_train[observed_indices]
+        y_obs = state.y_train[observed_indices]
+        theta0s = []
+        if state.current_theta is not None:
+            theta0s.append(state.current_theta.copy())
+        lo = np.array([b[0] for b in state.param_bounds], dtype=np.float64)
+        hi = np.array([b[1] for b in state.param_bounds], dtype=np.float64)
+        n_random = max(self.n_restarts - 1, 1)
+        for _ in range(n_random):
+            theta0s.append(lo + (hi - lo) * state.rng.random(state.n_params))
+        try:
+            return fitter.fit(
+                state.model_fn, X_obs, y_obs, state.n_params,
+                bounds=state.param_bounds, theta0s=theta0s,
+            )
+        except Exception:
+            return None
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 METHOD_REGISTRY = {
@@ -460,4 +556,5 @@ METHOD_REGISTRY = {
     "greedy_cheapest": GreedyCheapestMethod,
     "fim": FIMMethod,
     "ensemble_dopt": EnsembleDOptMethod,
+    "sltuner": SLTunerMethod,
 }

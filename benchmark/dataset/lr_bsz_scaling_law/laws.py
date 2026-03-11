@@ -56,7 +56,14 @@ def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
         log_pred = theta @ features.T
 
     pred = ops.exp(log_pred)
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # Jacobian: d pred / d theta_i = pred * features[:, i]
+    # pred: (B, M), features: (M, 15) -> jac: (B, M, 15)
+    jac = pred[:, :, None] * features[None, :, :]
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_2 (26p): Physics-inspired softplus-penalty model
@@ -86,17 +93,32 @@ def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     def softplus(x):
         return xp.log(1.0 + ops.exp(ops.clamp(x, min=-20.0, max=20.0)))
 
+    def sigmoid(x):
+        ex = ops.exp(ops.clamp(x, min=-20.0, max=20.0))
+        return ex / (1.0 + ex)
+
     # Base loss (power-law terms in exp form)
     Cp_s = softplus(Cp); ap_s = softplus(ap)
     Cd_s = softplus(Cd); ad_s = softplus(ad)
     Cdp_s = softplus(Cdp); adp_s = softplus(adp)
     Cbb_s = softplus(Cbb); abb_s = softplus(abb)
 
+    # Sigmoid for softplus derivatives
+    sig_Cp = sigmoid(Cp); sig_ap = sigmoid(ap)
+    sig_Cd = sigmoid(Cd); sig_ad = sigmoid(ad)
+    sig_Cdp = sigmoid(Cdp); sig_adp = sigmoid(adp)
+    sig_Cbb = sigmoid(Cbb); sig_abb = sigmoid(abb)
+
+    exp_P = ops.exp(-ap_s[:, None] * p[None, :])         # (B, M)
+    exp_D = ops.exp(-ad_s[:, None] * s[None, :])         # (B, M)
+    exp_DP = ops.exp(-adp_s[:, None] * (s[None, :] - k[:, None] * p[None, :]))  # (B, M)
+    exp_V = ops.exp(-abb_s[:, None] * v[None, :])        # (B, M)
+
     base = (L_inf[:, None]
-            + Cp_s[:, None] * ops.exp(-ap_s[:, None] * p[None, :])
-            + Cd_s[:, None] * ops.exp(-ad_s[:, None] * s[None, :])
-            + Cdp_s[:, None] * ops.exp(-adp_s[:, None] * (s[None, :] - k[:, None] * p[None, :]))
-            + Cbb_s[:, None] * ops.exp(-abb_s[:, None] * v[None, :]))
+            + Cp_s[:, None] * exp_P
+            + Cd_s[:, None] * exp_D
+            + Cdp_s[:, None] * exp_DP
+            + Cbb_s[:, None] * exp_V)
 
     # Optimal lr and bsz
     u_star = u0[:, None] + up_[:, None] * p[None, :] + us[:, None] * s[None, :] + uv[:, None] * v[None, :]
@@ -105,8 +127,12 @@ def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     dv = v[None, :] - v_star
 
     # State-dependent curvatures
-    cL = softplus(cL0[:, None] + cLp[:, None] * p[None, :] + cLs[:, None] * s[None, :] + cLv[:, None] * v[None, :])
-    cB = softplus(cB0[:, None] + cBp[:, None] * p[None, :] + cBs[:, None] * s[None, :] + cBv[:, None] * v[None, :])
+    zL = cL0[:, None] + cLp[:, None] * p[None, :] + cLs[:, None] * s[None, :] + cLv[:, None] * v[None, :]
+    zB = cB0[:, None] + cBp[:, None] * p[None, :] + cBs[:, None] * s[None, :] + cBv[:, None] * v[None, :]
+    cL = softplus(zL)
+    cB = softplus(zB)
+    sig_zL = sigmoid(zL)  # (B, M)
+    sig_zB = sigmoid(zB)  # (B, M)
 
     # Correlated penalty
     rho_t = xp.tanh(rho[:, None]) if hasattr(xp, 'tanh') else (ops.exp(2.0 * rho[:, None]) - 1.0) / (ops.exp(2.0 * rho[:, None]) + 1.0)
@@ -114,7 +140,122 @@ def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     penalty = cL * du ** 2 + cB * dv ** 2 + 2.0 * rho_t * g * du * dv
 
     pred = base + penalty
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # ---- Jacobian computation ----
+    # B_dim = theta.shape[0], M = X.shape[0], P = 26
+    ones_BM = pred * 0.0 + 1.0  # (B, M)
+    zeros_BM = pred * 0.0       # (B, M)
+
+    # Helper: g = sqrt(cL*cB), dg/dcL = 0.5*cB/g, dg/dcB = 0.5*cL/g
+    g_safe = ops.clamp_min(g, _EPS)
+    dg_dcL = 0.5 * cB / g_safe  # (B, M)
+    dg_dcB = 0.5 * cL / g_safe  # (B, M)
+
+    # d(penalty)/d(cL) = du^2 + 2*rho_t*dg_dcL*du*dv
+    dpen_dcL = du ** 2 + 2.0 * rho_t * dg_dcL * du * dv
+    # d(penalty)/d(cB) = dv^2 + 2*rho_t*dg_dcB*du*dv
+    dpen_dcB = dv ** 2 + 2.0 * rho_t * dg_dcB * du * dv
+
+    # d(penalty)/d(du) = 2*cL*du + 2*rho_t*g*dv
+    dpen_ddu = 2.0 * cL * du + 2.0 * rho_t * g * dv
+    # d(penalty)/d(dv) = 2*cB*dv + 2*rho_t*g*du
+    dpen_ddv = 2.0 * cB * dv + 2.0 * rho_t * g * du
+
+    # du = u - u_star, dv = v - v_star
+    # d(du)/d(u0) = -1, d(du)/d(up) = -p, d(du)/d(us) = -s, d(du)/d(uv) = -v
+    # d(dv)/d(v0) = -1, d(dv)/d(vp) = -p, d(dv)/d(vs) = -s
+
+    # d(penalty)/d(rho) = (1 - tanh(rho)^2) * 2*g*du*dv
+    drho_t = 1.0 - rho_t ** 2  # (B, M) or (B, 1) -> broadcast
+    dpen_drho = drho_t * 2.0 * g * du * dv  # (B, M)
+
+    # Now compute each partial:
+    # t[0] = L_inf: d/dL_inf = 1
+    d_0 = ones_BM
+
+    # t[1] = Cp: d/dCp = sig(Cp) * exp_P
+    d_1 = sig_Cp[:, None] * exp_P
+
+    # t[2] = ap: d/dap = sig(ap) * Cp_s * (-p) * exp_P
+    d_2 = sig_ap[:, None] * Cp_s[:, None] * (-p[None, :]) * exp_P
+
+    # t[3] = Cd: d/dCd = sig(Cd) * exp_D
+    d_3 = sig_Cd[:, None] * exp_D
+
+    # t[4] = ad: d/dad = sig(ad) * Cd_s * (-s) * exp_D
+    d_4 = sig_ad[:, None] * Cd_s[:, None] * (-s[None, :]) * exp_D
+
+    # t[5] = Cdp: d/dCdp = sig(Cdp) * exp_DP
+    d_5 = sig_Cdp[:, None] * exp_DP
+
+    # t[6] = adp: d/dadp = sig(adp) * Cdp_s * (-(s-k*p)) * exp_DP
+    d_6 = sig_adp[:, None] * Cdp_s[:, None] * (-(s[None, :] - k[:, None] * p[None, :])) * exp_DP
+
+    # t[7] = k: d/dk = Cdp_s * adp_s * p * exp_DP
+    d_7 = Cdp_s[:, None] * adp_s[:, None] * p[None, :] * exp_DP
+
+    # t[8] = u0: d/du0 = dpen_ddu * (-1)
+    d_8 = dpen_ddu * (-1.0)
+
+    # t[9] = up: d/dup = dpen_ddu * (-p)
+    d_9 = dpen_ddu * (-p[None, :])
+
+    # t[10] = us: d/dus = dpen_ddu * (-s)
+    d_10 = dpen_ddu * (-s[None, :])
+
+    # t[11] = uv: d/duv = dpen_ddu * (-v)
+    d_11 = dpen_ddu * (-v[None, :])
+
+    # t[12] = v0: d/dv0 = dpen_ddv * (-1)
+    d_12 = dpen_ddv * (-1.0)
+
+    # t[13] = vp: d/dvp = dpen_ddv * (-p)
+    d_13 = dpen_ddv * (-p[None, :])
+
+    # t[14] = vs: d/dvs = dpen_ddv * (-s)
+    d_14 = dpen_ddv * (-s[None, :])
+
+    # t[15] = cL0: d/dcL0 = dpen_dcL * sig_zL * 1
+    d_15 = dpen_dcL * sig_zL
+
+    # t[16] = cLp: d/dcLp = dpen_dcL * sig_zL * p
+    d_16 = dpen_dcL * sig_zL * p[None, :]
+
+    # t[17] = cLs: d/dcLs = dpen_dcL * sig_zL * s
+    d_17 = dpen_dcL * sig_zL * s[None, :]
+
+    # t[18] = cB0: d/dcB0 = dpen_dcB * sig_zB * 1
+    d_18 = dpen_dcB * sig_zB
+
+    # t[19] = cBp: d/dcBp = dpen_dcB * sig_zB * p
+    d_19 = dpen_dcB * sig_zB * p[None, :]
+
+    # t[20] = cBs: d/dcBs = dpen_dcB * sig_zB * s
+    d_20 = dpen_dcB * sig_zB * s[None, :]
+
+    # t[21] = rho: d/drho = dpen_drho
+    d_21 = dpen_drho
+
+    # t[22] = cLv: d/dcLv = dpen_dcL * sig_zL * v
+    d_22 = dpen_dcL * sig_zL * v[None, :]
+
+    # t[23] = cBv: d/dcBv = dpen_dcB * sig_zB * v
+    d_23 = dpen_dcB * sig_zB * v[None, :]
+
+    # t[24] = Cbb: d/dCbb = sig(Cbb) * exp_V
+    d_24 = sig_Cbb[:, None] * exp_V
+
+    # t[25] = abb: d/dabb = sig(abb) * Cbb_s * (-v) * exp_V
+    d_25 = sig_abb[:, None] * Cbb_s[:, None] * (-v[None, :]) * exp_V
+
+    jac = ops.stack([d_0, d_1, d_2, d_3, d_4, d_5, d_6, d_7,
+                     d_8, d_9, d_10, d_11, d_12, d_13, d_14,
+                     d_15, d_16, d_17, d_18, d_19, d_20, d_21,
+                     d_22, d_23, d_24, d_25], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_3 (24p): Chinchilla power-law + decoupled LR/BSZ quadratic valleys
@@ -137,21 +278,126 @@ def sl_3(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     C0, CN, CD, CB, mu0, muN, muD, muB, muND = t[8:17]
     G0, GN, GD, nu0, nuN, nuD, nuND = t[17:24]
 
+    # Intermediate computations
+    P_neg_alpha = P[None, :] ** (-alpha[:, None])       # (B, M)
+    D_neg_beta = D[None, :] ** (-beta[:, None])         # (B, M)
+    PwN = P[None, :] ** wN[:, None]                     # (B, M)
+    DwD = D[None, :] ** wD[:, None]                     # (B, M)
+    denom = ops.clamp_min(PwN * DwD, _EPS)
+    joint_term = F[:, None] / denom                     # (B, M)
+
     base = (E[:, None]
-            + A[:, None] * (P[None, :] ** (-alpha[:, None]))
-            + B[:, None] * (D[None, :] ** (-beta[:, None]))
-            + F[:, None] / (ops.clamp_min(P[None, :] ** wN[:, None] * D[None, :] ** wD[:, None], _EPS)))
+            + A[:, None] * P_neg_alpha
+            + B[:, None] * D_neg_beta
+            + joint_term)
 
     opt_lr = mu0[:, None] + muN[:, None]*lnP[None, :] + muD[:, None]*lnD[None, :] + muB[:, None]*lnb[None, :] + muND[:, None]*lnP[None, :]*lnD[None, :]
-    C_eff = C0[:, None] * ops.exp(CN[:, None]*lnP[None, :] + CD[:, None]*lnD[None, :] + CB[:, None]*lnb[None, :])
-    lr_pen = C_eff * (lnlr[None, :] - opt_lr) ** 2
+    lr_exp = CN[:, None]*lnP[None, :] + CD[:, None]*lnD[None, :] + CB[:, None]*lnb[None, :]
+    C_eff = C0[:, None] * ops.exp(lr_exp)
+    dlr = lnlr[None, :] - opt_lr
+    lr_pen = C_eff * dlr ** 2
 
     opt_bsz = nu0[:, None] + nuN[:, None]*lnP[None, :] + nuD[:, None]*lnD[None, :] + nuND[:, None]*lnP[None, :]*lnD[None, :]
-    G_eff = G0[:, None] * ops.exp(GN[:, None]*lnP[None, :] + GD[:, None]*lnD[None, :])
-    bsz_pen = G_eff * (lnb[None, :] - opt_bsz) ** 2
+    bsz_exp = GN[:, None]*lnP[None, :] + GD[:, None]*lnD[None, :]
+    G_eff = G0[:, None] * ops.exp(bsz_exp)
+    dbsz = lnb[None, :] - opt_bsz
+    bsz_pen = G_eff * dbsz ** 2
 
     pred = base + lr_pen + bsz_pen
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # ---- Jacobian ----
+    ones_BM = pred * 0.0 + 1.0
+
+    # d/dE = 1
+    d_E = ones_BM
+
+    # d/dA = P^(-alpha)
+    d_A = P_neg_alpha
+
+    # d/dalpha = A * P^(-alpha) * (-lnP) = -A * P_neg_alpha * lnP
+    d_alpha = -A[:, None] * P_neg_alpha * lnP[None, :]
+
+    # d/dB = D^(-beta)
+    d_B = D_neg_beta
+
+    # d/dbeta = -B * D^(-beta) * lnD
+    d_beta = -B[:, None] * D_neg_beta * lnD[None, :]
+
+    # d/dF = 1/denom
+    d_F = 1.0 / denom
+
+    # d/dwN = F * d/dwN(1/(P^wN * D^wD)) = F * (-lnP) / denom = -joint_term * lnP
+    d_wN = -joint_term * lnP[None, :]
+
+    # d/dwD = -joint_term * lnD
+    d_wD = -joint_term * lnD[None, :]
+
+    # LR penalty partials
+    # C_eff = C0 * exp(lr_exp), dlr = lnlr - opt_lr
+    # lr_pen = C_eff * dlr^2
+
+    # d/dC0 = exp(lr_exp) * dlr^2
+    d_C0 = ops.exp(lr_exp) * dlr ** 2
+
+    # d/dCN = C_eff * lnP * dlr^2 (chain through lr_exp)
+    d_CN = C_eff * lnP[None, :] * dlr ** 2
+
+    # d/dCD = C_eff * lnD * dlr^2
+    d_CD = C_eff * lnD[None, :] * dlr ** 2
+
+    # d/dCB = C_eff * lnb * dlr^2
+    d_CB = C_eff * lnb[None, :] * dlr ** 2
+
+    # d/dmu0 = C_eff * 2*dlr * (-1) = -2*C_eff*dlr
+    d_mu0 = -2.0 * C_eff * dlr
+
+    # d/dmuN = -2*C_eff*dlr * lnP
+    d_muN = -2.0 * C_eff * dlr * lnP[None, :]
+
+    # d/dmuD = -2*C_eff*dlr * lnD
+    d_muD = -2.0 * C_eff * dlr * lnD[None, :]
+
+    # d/dmuB = -2*C_eff*dlr * lnb
+    d_muB = -2.0 * C_eff * dlr * lnb[None, :]
+
+    # d/dmuND = -2*C_eff*dlr * lnP*lnD
+    d_muND = -2.0 * C_eff * dlr * lnP[None, :] * lnD[None, :]
+
+    # BSZ penalty partials
+    # G_eff = G0 * exp(bsz_exp), dbsz = lnb - opt_bsz
+    # bsz_pen = G_eff * dbsz^2
+
+    # d/dG0 = exp(bsz_exp) * dbsz^2
+    d_G0 = ops.exp(bsz_exp) * dbsz ** 2
+
+    # d/dGN = G_eff * lnP * dbsz^2
+    d_GN = G_eff * lnP[None, :] * dbsz ** 2
+
+    # d/dGD = G_eff * lnD * dbsz^2
+    d_GD = G_eff * lnD[None, :] * dbsz ** 2
+
+    # d/dnu0 = -2*G_eff*dbsz
+    d_nu0 = -2.0 * G_eff * dbsz
+
+    # d/dnuN = -2*G_eff*dbsz * lnP
+    d_nuN = -2.0 * G_eff * dbsz * lnP[None, :]
+
+    # d/dnuD = -2*G_eff*dbsz * lnD
+    d_nuD = -2.0 * G_eff * dbsz * lnD[None, :]
+
+    # d/dnuND = -2*G_eff*dbsz * lnP*lnD
+    d_nuND = -2.0 * G_eff * dbsz * lnP[None, :] * lnD[None, :]
+
+    # Order: [E, A, alpha, B, beta, F, wN, wD,
+    #         C0, CN, CD, CB, mu0, muN, muD, muB, muND,
+    #         G0, GN, GD, nu0, nuN, nuD, nuND]
+    jac = ops.stack([d_E, d_A, d_alpha, d_B, d_beta, d_F, d_wN, d_wD,
+                     d_C0, d_CN, d_CD, d_CB, d_mu0, d_muN, d_muD, d_muB, d_muND,
+                     d_G0, d_GN, d_GD, d_nu0, d_nuN, d_nuD, d_nuND], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_4 (20p): Log-polynomial-2 + inverse features
@@ -187,7 +433,13 @@ def sl_4(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
         features = xp.stack(feat_list, axis=-1)
         log_pred = theta @ features.T
     pred = ops.exp(log_pred)
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # Jacobian: same as sl_1, d pred / d theta_i = pred * features[:, i]
+    jac = pred[:, :, None] * features[None, :, :]
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_5 (19p): Chinchilla + exp-decay + LR quadratic penalty
@@ -211,17 +463,107 @@ def sl_5(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     clr0, u0, kb, kn, kd, wb, wn, ws = t[7:15]
     AR, aR, AX, aX = t[15:19]
 
+    exp_N = ops.exp(-aN[:, None] * n[None, :])            # (B, M)
+    exp_D = ops.exp(-aD[:, None] * s[None, :])            # (B, M)
+    exp_V = ops.exp(-aB[:, None] * v[None, :])            # (B, M)
+
     base = (L0[:, None]
-            + AN[:, None] * ops.exp(-aN[:, None] * n[None, :])
-            + AD[:, None] * ops.exp(-aD[:, None] * s[None, :])
-            + AB[:, None] * ops.exp(-aB[:, None] * v[None, :]))
-    ratio_term = AR[:, None] * ops.exp(-aR[:, None] * (s[None, :] - n[None, :]) ** 2)
-    cross_term = AX[:, None] * ops.exp(-aX[:, None] * (s[None, :] - v[None, :]))
+            + AN[:, None] * exp_N
+            + AD[:, None] * exp_D
+            + AB[:, None] * exp_V)
+
+    sn_diff = s[None, :] - n[None, :]
+    sn_diff_sq = sn_diff ** 2
+    exp_R = ops.exp(-aR[:, None] * sn_diff_sq)            # (B, M)
+    ratio_term = AR[:, None] * exp_R
+
+    sv_diff = s[None, :] - v[None, :]
+    exp_X = ops.exp(-aX[:, None] * sv_diff)               # (B, M)
+    cross_term = AX[:, None] * exp_X
+
     u_star = u0[:, None] + kb[:, None]*v[None, :] + kn[:, None]*n[None, :] + kd[:, None]*s[None, :]
-    lr_amp = clr0[:, None] * ops.exp(-wb[:, None]*v[None, :] - wn[:, None]*n[None, :] - ws[:, None]*s[None, :])
-    lr_pen = lr_amp * (u[None, :] - u_star) ** 2
+    lr_exp_arg = -wb[:, None]*v[None, :] - wn[:, None]*n[None, :] - ws[:, None]*s[None, :]
+    lr_amp = clr0[:, None] * ops.exp(lr_exp_arg)
+    du = u[None, :] - u_star
+    du_sq = du ** 2
+    lr_pen = lr_amp * du_sq
+
     pred = base + ratio_term + cross_term + lr_pen
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # ---- Jacobian ----
+    ones_BM = pred * 0.0 + 1.0
+
+    # t[0] = L0
+    d_0 = ones_BM
+
+    # t[1] = AN: d/dAN = exp_N
+    d_1 = exp_N
+
+    # t[2] = aN: d/daN = AN * (-n) * exp_N
+    d_2 = AN[:, None] * (-n[None, :]) * exp_N
+
+    # t[3] = AD: d/dAD = exp_D
+    d_3 = exp_D
+
+    # t[4] = aD: d/daD = AD * (-s) * exp_D
+    d_4 = AD[:, None] * (-s[None, :]) * exp_D
+
+    # t[5] = AB: d/dAB = exp_V
+    d_5 = exp_V
+
+    # t[6] = aB: d/daB = AB * (-v) * exp_V
+    d_6 = AB[:, None] * (-v[None, :]) * exp_V
+
+    # lr_pen = clr0 * exp(lr_exp_arg) * du^2
+    # lr_amp = clr0 * exp(lr_exp_arg)
+    exp_lr = ops.exp(lr_exp_arg)
+
+    # t[7] = clr0: d/dclr0 = exp(lr_exp_arg) * du^2
+    d_7 = exp_lr * du_sq
+
+    # d(lr_pen)/d(du) = lr_amp * 2*du; d(du)/d(u0) = -1
+    dlrpen_ddu = 2.0 * lr_amp * du
+
+    # t[8] = u0: d/du0 = -dlrpen_ddu
+    d_8 = -dlrpen_ddu
+
+    # t[9] = kb: d/dkb = dlrpen_ddu * (-v)
+    d_9 = dlrpen_ddu * (-v[None, :])
+
+    # t[10] = kn: d/dkn = dlrpen_ddu * (-n)
+    d_10 = dlrpen_ddu * (-n[None, :])
+
+    # t[11] = kd: d/dkd = dlrpen_ddu * (-s)
+    d_11 = dlrpen_ddu * (-s[None, :])
+
+    # t[12] = wb: d/dwb = lr_pen * (-v)  (chain through exp)
+    d_12 = lr_pen * (-v[None, :])
+
+    # t[13] = wn: d/dwn = lr_pen * (-n)
+    d_13 = lr_pen * (-n[None, :])
+
+    # t[14] = ws: d/dws = lr_pen * (-s)
+    d_14 = lr_pen * (-s[None, :])
+
+    # t[15] = AR: d/dAR = exp_R
+    d_15 = exp_R
+
+    # t[16] = aR: d/daR = AR * (-(s-n)^2) * exp_R
+    d_16 = AR[:, None] * (-sn_diff_sq) * exp_R
+
+    # t[17] = AX: d/dAX = exp_X
+    d_17 = exp_X
+
+    # t[18] = aX: d/daX = AX * (-(s-v)) * exp_X
+    d_18 = AX[:, None] * (-sv_diff) * exp_X
+
+    jac = ops.stack([d_0, d_1, d_2, d_3, d_4, d_5, d_6,
+                     d_7, d_8, d_9, d_10, d_11, d_12, d_13, d_14,
+                     d_15, d_16, d_17, d_18], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_6 (14p): L_inf + exp(partial poly2)
@@ -254,8 +596,60 @@ def sl_6(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
                 + t[10][:, None]*lnlr[None, :]*lnD[None, :] + t[11][:, None]*lnlr[None, :]*lnP[None, :]
                 + t[12][:, None]*lnb[None, :]*lnD[None, :] + t[13][:, None]*lnb[None, :]*lnP[None, :])
     exponent = ops.clamp(exponent, min=-50.0, max=50.0)
-    pred = L_inf[:, None] + ops.exp(exponent)
-    return pred[0] if pred.shape[0] == 1 else pred
+    exp_term = ops.exp(exponent)
+    pred = L_inf[:, None] + exp_term
+
+    # ---- Jacobian ----
+    # d/dL_inf = 1
+    ones_BM = pred * 0.0 + 1.0
+    d_0 = ones_BM
+
+    # For t[1..13]: d/dt_i = exp_term * (feature_i)
+    # feature for t[1] = 1 (w0)
+    d_1 = exp_term
+
+    # t[2] = w_d: feature = lnD
+    d_2 = exp_term * lnD[None, :]
+
+    # t[3] = w_p: feature = lnP
+    d_3 = exp_term * lnP[None, :]
+
+    # t[4] = w_dp: feature = lnD*lnP
+    d_4 = exp_term * lnD[None, :] * lnP[None, :]
+
+    # t[5] = w_lr: feature = lnlr
+    d_5 = exp_term * lnlr[None, :]
+
+    # t[6] = w_lr2: feature = lnlr^2
+    d_6 = exp_term * lnlr[None, :] ** 2
+
+    # t[7] = w_bsz: feature = lnb
+    d_7 = exp_term * lnb[None, :]
+
+    # t[8] = w_bsz2: feature = lnb^2
+    d_8 = exp_term * lnb[None, :] ** 2
+
+    # t[9] = w_lrbsz: feature = lnlr*lnb
+    d_9 = exp_term * lnlr[None, :] * lnb[None, :]
+
+    # t[10] = w_lrD: feature = lnlr*lnD
+    d_10 = exp_term * lnlr[None, :] * lnD[None, :]
+
+    # t[11] = w_lrP: feature = lnlr*lnP
+    d_11 = exp_term * lnlr[None, :] * lnP[None, :]
+
+    # t[12] = w_bszD: feature = lnb*lnD
+    d_12 = exp_term * lnb[None, :] * lnD[None, :]
+
+    # t[13] = w_bszP: feature = lnb*lnP
+    d_13 = exp_term * lnb[None, :] * lnP[None, :]
+
+    jac = ops.stack([d_0, d_1, d_2, d_3, d_4, d_5, d_6, d_7,
+                     d_8, d_9, d_10, d_11, d_12, d_13], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_7 (31p): E + exp(poly2_A) + exp(poly2_B) dual-term
@@ -294,8 +688,32 @@ def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
         log2 = w2 @ features.T
     log1 = ops.clamp(log1, min=-50.0, max=50.0)
     log2 = ops.clamp(log2, min=-50.0, max=50.0)
-    pred = E[:, None] + ops.exp(log1) + ops.exp(log2)
-    return pred[0] if pred.shape[0] == 1 else pred
+    exp1 = ops.exp(log1)
+    exp2 = ops.exp(log2)
+    pred = E[:, None] + exp1 + exp2
+
+    # ---- Jacobian ----
+    # d/dE = 1
+    ones_BM = pred * 0.0 + 1.0
+
+    # d/dw1_i = exp1 * features[:, i] -> (B, M)
+    # d/dw2_i = exp2 * features[:, i] -> (B, M)
+    # jac_w1: (B, M, 15) = exp1[:,:,None] * features[None,:,:]
+    jac_w1 = exp1[:, :, None] * features[None, :, :]  # (B, M, 15)
+    jac_w2 = exp2[:, :, None] * features[None, :, :]  # (B, M, 15)
+
+    # Build full jac: [d_E, jac_w1[...,0], ..., jac_w1[...,14], jac_w2[...,0], ..., jac_w2[...,14]]
+    partials = [ones_BM]
+    for i in range(15):
+        partials.append(jac_w1[:, :, i])
+    for i in range(15):
+        partials.append(jac_w2[:, :, i])
+
+    jac = ops.stack(partials, axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_8 (20p): Chinchilla + asymmetric tanh-skewed penalties
@@ -324,36 +742,155 @@ def sl_8(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     def softplus(x):
         return xp.log(1.0 + ops.exp(ops.clamp(x, min=-20.0, max=20.0)))
 
+    def sigmoid(x):
+        ex = ops.exp(ops.clamp(x, min=-20.0, max=20.0))
+        return ex / (1.0 + ex)
+
     def tanh(x):
         e2x = ops.exp(ops.clamp(2.0 * x, min=-40.0, max=40.0))
         return (e2x - 1.0) / (e2x + 1.0)
 
-    L0 = t[0]
-    cP = softplus(t[1]); aP = softplus(t[2])
-    cD = softplus(t[3]); aD = softplus(t[4])
-    cR = softplus(t[5]); aR = softplus(t[6])
+    def dtanh(x, tanh_x):
+        """Derivative of tanh: 1 - tanh(x)^2. Reuses precomputed tanh_x."""
+        return 1.0 - tanh_x ** 2
 
-    term_P = cP[:, None] * ops.exp(-aP[:, None] * p[None, :])
-    term_D = cD[:, None] * ops.exp(-aD[:, None] * s[None, :])
-    term_R = cR[:, None] * ops.exp(-aR[:, None] * (s[None, :] - p[None, :]))
+    L0 = t[0]
+    cP_raw = t[1]; aP_raw = t[2]
+    cD_raw = t[3]; aD_raw = t[4]
+    cR_raw = t[5]; aR_raw = t[6]
+
+    cP = softplus(cP_raw); aP = softplus(aP_raw)
+    cD = softplus(cD_raw); aD = softplus(aD_raw)
+    cR = softplus(cR_raw); aR = softplus(aR_raw)
+
+    sig_cP = sigmoid(cP_raw); sig_aP = sigmoid(aP_raw)
+    sig_cD = sigmoid(cD_raw); sig_aD = sigmoid(aD_raw)
+    sig_cR = sigmoid(cR_raw); sig_aR = sigmoid(aR_raw)
+
+    exp_P = ops.exp(-aP[:, None] * p[None, :])
+    exp_D = ops.exp(-aD[:, None] * s[None, :])
+    sp_diff = s[None, :] - p[None, :]
+    exp_R = ops.exp(-aR[:, None] * sp_diff)
+
+    term_P = cP[:, None] * exp_P
+    term_D = cD[:, None] * exp_D
+    term_R = cR[:, None] * exp_R
 
     lr_opt = t[7][:, None] + t[8][:, None]*v[None, :] + t[9][:, None]*p[None, :] + t[10][:, None]*s[None, :]
     dev_lr = u[None, :] - lr_opt
-    k_lr = softplus(t[11])
-    a_lr = tanh(t[12])
-    lr_pen = k_lr[:, None] * dev_lr**2 * (1.0 + a_lr[:, None] * tanh(dev_lr))
+    k_lr_raw = t[11]; a_lr_raw = t[12]
+    k_lr = softplus(k_lr_raw)
+    a_lr = tanh(a_lr_raw)
+    sig_k_lr = sigmoid(k_lr_raw)
+    dtanh_a_lr = dtanh(a_lr_raw, a_lr)  # 1 - tanh(a_lr_raw)^2
+
+    tanh_dev_lr = tanh(dev_lr)
+    dtanh_dev_lr = dtanh(dev_lr, tanh_dev_lr)
+    lr_pen = k_lr[:, None] * dev_lr**2 * (1.0 + a_lr[:, None] * tanh_dev_lr)
 
     ns = u[None, :] - 0.5 * v[None, :]
     ns_opt = t[13][:, None] + t[14][:, None]*p[None, :] + t[15][:, None]*s[None, :]
     dev_ns = ns - ns_opt
-    k_ns = softplus(t[16])
-    a_ns = tanh(t[17])
-    ns_pen = k_ns[:, None] * dev_ns**2 * (1.0 + a_ns[:, None] * tanh(dev_ns))
+    k_ns_raw = t[16]; a_ns_raw = t[17]
+    k_ns = softplus(k_ns_raw)
+    a_ns = tanh(a_ns_raw)
+    sig_k_ns = sigmoid(k_ns_raw)
+    dtanh_a_ns = dtanh(a_ns_raw, a_ns)
 
-    dp_pen = softplus(t[19])[:, None] * ((s[None, :] - p[None, :]) - t[18][:, None])**2
+    tanh_dev_ns = tanh(dev_ns)
+    dtanh_dev_ns = dtanh(dev_ns, tanh_dev_ns)
+    ns_pen = k_ns[:, None] * dev_ns**2 * (1.0 + a_ns[:, None] * tanh_dev_ns)
+
+    delta0 = t[18]
+    k_dp_raw = t[19]
+    k_dp = softplus(k_dp_raw)
+    sig_k_dp = sigmoid(k_dp_raw)
+    dp_diff = sp_diff - delta0[:, None]
+    dp_pen = k_dp[:, None] * dp_diff**2
 
     pred = L0[:, None] + term_P + term_D + term_R + lr_pen + ns_pen + dp_pen
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # ---- Jacobian ----
+    ones_BM = pred * 0.0 + 1.0
+
+    # t[0] = L0
+    d_0 = ones_BM
+
+    # t[1] = cP (pre-softplus): d/dcP_raw = sig(cP_raw) * exp_P
+    d_1 = sig_cP[:, None] * exp_P
+
+    # t[2] = aP (pre-softplus): d/daP_raw = sig(aP_raw) * cP * (-p) * exp_P
+    d_2 = sig_aP[:, None] * cP[:, None] * (-p[None, :]) * exp_P
+
+    # t[3] = cD: d/dcD_raw = sig(cD_raw) * exp_D
+    d_3 = sig_cD[:, None] * exp_D
+
+    # t[4] = aD: d/daD_raw = sig(aD_raw) * cD * (-s) * exp_D
+    d_4 = sig_aD[:, None] * cD[:, None] * (-s[None, :]) * exp_D
+
+    # t[5] = cR: d/dcR_raw = sig(cR_raw) * exp_R
+    d_5 = sig_cR[:, None] * exp_R
+
+    # t[6] = aR: d/daR_raw = sig(aR_raw) * cR * (-(s-p)) * exp_R
+    d_6 = sig_aR[:, None] * cR[:, None] * (-sp_diff) * exp_R
+
+    # For lr_pen = k_lr * dev^2 * (1 + a_lr * tanh(dev))
+    # Let h(dev) = dev^2 * (1 + a_lr * tanh(dev))
+    # dh/d(dev) = 2*dev*(1 + a_lr*tanh(dev)) + dev^2*a_lr*(1-tanh(dev)^2)
+    bracket_lr = 1.0 + a_lr[:, None] * tanh_dev_lr
+    dh_ddev_lr = 2.0 * dev_lr * bracket_lr + dev_lr**2 * a_lr[:, None] * dtanh_dev_lr
+
+    # t[7] = phi0: d(dev)/d(phi0) = -1
+    d_7 = k_lr[:, None] * dh_ddev_lr * (-1.0)
+
+    # t[8] = phi_b: d(dev)/d(phi_b) = -v
+    d_8 = k_lr[:, None] * dh_ddev_lr * (-v[None, :])
+
+    # t[9] = phi_p: d(dev)/d(phi_p) = -p
+    d_9 = k_lr[:, None] * dh_ddev_lr * (-p[None, :])
+
+    # t[10] = phi_d: d(dev)/d(phi_d) = -s
+    d_10 = k_lr[:, None] * dh_ddev_lr * (-s[None, :])
+
+    # t[11] = k_lr (pre-softplus): d/dk_lr_raw = sig(k_lr_raw) * dev^2 * bracket_lr
+    d_11 = sig_k_lr[:, None] * dev_lr**2 * bracket_lr
+
+    # t[12] = a_lr (pre-tanh): d/da_lr_raw = dtanh(a_lr_raw) * k_lr * dev^2 * tanh(dev)
+    d_12 = dtanh_a_lr[:, None] * k_lr[:, None] * dev_lr**2 * tanh_dev_lr
+
+    # For ns_pen = k_ns * dev_ns^2 * (1 + a_ns * tanh(dev_ns))
+    bracket_ns = 1.0 + a_ns[:, None] * tanh_dev_ns
+    dh_ddev_ns = 2.0 * dev_ns * bracket_ns + dev_ns**2 * a_ns[:, None] * dtanh_dev_ns
+
+    # t[13] = psi0: d(dev_ns)/d(psi0) = -1
+    d_13 = k_ns[:, None] * dh_ddev_ns * (-1.0)
+
+    # t[14] = psi_p: d(dev_ns)/d(psi_p) = -p
+    d_14 = k_ns[:, None] * dh_ddev_ns * (-p[None, :])
+
+    # t[15] = psi_d: d(dev_ns)/d(psi_d) = -s
+    d_15 = k_ns[:, None] * dh_ddev_ns * (-s[None, :])
+
+    # t[16] = k_ns (pre-softplus): d/dk_ns_raw = sig(k_ns_raw) * dev_ns^2 * bracket_ns
+    d_16 = sig_k_ns[:, None] * dev_ns**2 * bracket_ns
+
+    # t[17] = a_ns (pre-tanh): d/da_ns_raw = dtanh(a_ns_raw) * k_ns * dev_ns^2 * tanh(dev_ns)
+    d_17 = dtanh_a_ns[:, None] * k_ns[:, None] * dev_ns**2 * tanh_dev_ns
+
+    # t[18] = delta0: dp_pen = k_dp * ((s-p) - delta0)^2
+    # d/ddelta0 = k_dp * 2*((s-p)-delta0) * (-1) = -2*k_dp*dp_diff
+    d_18 = -2.0 * k_dp[:, None] * dp_diff
+
+    # t[19] = k_dp (pre-softplus): d/dk_dp_raw = sig(k_dp_raw) * dp_diff^2
+    d_19 = sig_k_dp[:, None] * dp_diff**2
+
+    jac = ops.stack([d_0, d_1, d_2, d_3, d_4, d_5, d_6,
+                     d_7, d_8, d_9, d_10, d_11, d_12,
+                     d_13, d_14, d_15, d_16, d_17, d_18, d_19], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_9 (15p): Direct poly2(log10) without exp transform
@@ -386,7 +923,18 @@ def sl_9(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     else:
         features = xp.stack(feat_list, axis=-1)
         pred = theta @ features.T
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # Jacobian: pred = theta @ features.T (linear in theta)
+    # d pred / d theta_i = features[:, i], broadcast to (B, M)
+    # jac shape: (B, M, 15)
+    B = theta.shape[0]
+    M = features.shape[0]
+    # features is (M, 15), broadcast to (B, M, 15)
+    jac = xp.broadcast_to(features[None, :, :], (B, M, 15)) * 1.0
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_10 (18p): Direct poly2(log) + fixed-exponent power features
@@ -417,11 +965,39 @@ def sl_10(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     w_D = theta[:, 15]
     w_P = theta[:, 16]
     w_bsz = theta[:, 17]
-    power_terms = (w_D[:, None] * (D[None, :] ** (-0.5))
-                   + w_P[:, None] * (P[None, :] ** (-0.5))
-                   + w_bsz[:, None] / bsz[None, :])
+
+    D_inv_sqrt = D[None, :] ** (-0.5)
+    P_inv_sqrt = P[None, :] ** (-0.5)
+    bsz_inv = 1.0 / bsz[None, :]
+
+    power_terms = (w_D[:, None] * D_inv_sqrt
+                   + w_P[:, None] * P_inv_sqrt
+                   + w_bsz[:, None] * bsz_inv)
     pred = poly + power_terms
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # ---- Jacobian ----
+    B = theta.shape[0]
+    M = features.shape[0]
+
+    # For c0..c14: d/dc_i = features[:, i], broadcast to (B, M)
+    # For w_D: d/dw_D = D^(-0.5)
+    # For w_P: d/dw_P = P^(-0.5)
+    # For w_bsz: d/dw_bsz = 1/bsz
+    ones_BM = pred * 0.0 + 1.0
+
+    partials = []
+    for i in range(15):
+        # features[:, i] has shape (M,), broadcast to (B, M)
+        partials.append(ones_BM * features[:, i][None, :])
+    partials.append(D_inv_sqrt * ones_BM)
+    partials.append(P_inv_sqrt * ones_BM)
+    partials.append(bsz_inv * ones_BM)
+
+    jac = ops.stack(partials, axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 PARAM_BOUNDS = {

@@ -36,6 +36,7 @@ def _init_state(gd: GroupData, task: ScalingLawTask, seed: int) -> SelectionStat
         model_fn=task.model_fn,
         n_params=task.n_params,
         param_bounds=task.param_bounds,
+        y_train=gd.y_train,
     )
 
 
@@ -53,7 +54,7 @@ def _evaluate_global(task: ScalingLawTask, group_thetas: Dict[str, np.ndarray]) 
             continue
         theta_2d = theta.reshape(1, -1)
         try:
-            pred = task.model_fn(theta_2d, gd.X_test)
+            pred = task.model_fn(theta_2d, gd.X_test)[0]
             pred_arr = np.asarray(pred, dtype=np.float64)
             if not np.all(np.isfinite(pred_arr)):
                 continue
@@ -148,21 +149,6 @@ def run_repeat(
     method,
     fitter,
     seeds: List[int],
-    max_workers: int = 1,
 ) -> List[RunResult]:
-    """Run the same task across multiple seeds, optionally in parallel."""
-    if max_workers <= 1:
-        return [run_single(task, method, fitter, s) for s in seeds]
-
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    results = [None] * len(seeds)
-    with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        future_to_idx = {
-            pool.submit(run_single, task, method, fitter, s): i
-            for i, s in enumerate(seeds)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            results[idx] = future.result()
-    return results
+    """Run the same task across multiple seeds (sequentially)."""
+    return [run_single(task, method, fitter, s) for s in seeds]

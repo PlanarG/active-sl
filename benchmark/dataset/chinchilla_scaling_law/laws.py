@@ -17,6 +17,7 @@ _EPS = 1e-12
 # theta: [E, A, alpha, B, beta]
 def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
 
@@ -29,11 +30,30 @@ def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     B = theta[:, 3]
     beta = theta[:, 4]
 
-    term_N = A[:, None] / ops.clamp_min(N[None, :] ** alpha[:, None], _EPS)
-    term_D = B[:, None] / ops.clamp_min(D[None, :] ** beta[:, None], _EPS)
+    log_N = xp.log(ops.clamp_min(N, _EPS))  # (M,)
+    log_D = xp.log(ops.clamp_min(D, _EPS))  # (M,)
 
-    pred = E[:, None] + term_N + term_D
-    return pred[0] if pred.shape[0] == 1 else pred
+    # term_N = A * N^(-alpha),  term_D = B * D^(-beta)
+    term_N = A[:, None] / ops.clamp_min(N[None, :] ** alpha[:, None], _EPS)  # (B, M)
+    term_D = B[:, None] / ops.clamp_min(D[None, :] ** beta[:, None], _EPS)   # (B, M)
+
+    pred = E[:, None] + term_N + term_D  # (B, M)
+
+    # Jacobian: (B, M, 5)
+    ones = pred * 0.0 + 1.0  # (B, M)
+    d_E = ones
+    N_neg_alpha = 1.0 / ops.clamp_min(N[None, :] ** alpha[:, None], _EPS)  # N^(-alpha)
+    D_neg_beta = 1.0 / ops.clamp_min(D[None, :] ** beta[:, None], _EPS)   # D^(-beta)
+    d_A = N_neg_alpha
+    d_alpha = -term_N * log_N[None, :]
+    d_B = D_neg_beta
+    d_beta = -term_D * log_D[None, :]
+
+    jac = ops.stack([d_E, d_A, d_alpha, d_B, d_beta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 LAW_REGISTRY = {"sl_1": sl_1}

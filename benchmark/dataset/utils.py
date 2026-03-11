@@ -51,6 +51,11 @@ class BackendOps:
     def exp(self, x):
         return self.xp.exp(x)
 
+    def stack(self, arrays, axis=-1):
+        if self.backend == "torch":
+            return self.xp.stack(arrays, dim=axis)
+        return self.xp.stack(arrays, axis=axis)
+
 def get_ops(backend: Backend) -> BackendOps:
     if backend == "numpy":
         xp = np

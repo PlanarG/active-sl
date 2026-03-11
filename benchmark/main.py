@@ -99,7 +99,7 @@ def main():
                         help="Explicit seeds (overrides --repeat)")
     parser.add_argument("--n-restarts", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8,
-                        help="Number of threads for parallel seed repetitions")
+                        help="Number of processes for parallel multistart refit")
     parser.add_argument("--no-plot", action="store_true",
                         help="Skip generating plots")
     parser.add_argument("--task-filter", type=str, default=None,
@@ -153,14 +153,18 @@ def main():
     else:
         method_cls = METHOD_REGISTRY[args.method]
 
-    method = method_cls()
-    fitter = FITTER_REGISTRY[args.fitter](n_restarts=args.n_restarts)
+    try:
+        method = method_cls(max_workers=args.workers)
+    except TypeError:
+        method = method_cls()
+    fitter = FITTER_REGISTRY[args.fitter](n_restarts=args.n_restarts,
+                                          max_workers=args.workers)
 
     result_path = output_dir / "result.json"
     aggregated = []
     for task in tasks:
         print(f"Running {task.task_id} x{len(seeds)} seeds ...", file=sys.stderr)
-        results = run_repeat(task, method, fitter, seeds, max_workers=args.workers)
+        results = run_repeat(task, method, fitter, seeds)
         agg = _aggregate_results(results)
         aggregated.append(agg)
 

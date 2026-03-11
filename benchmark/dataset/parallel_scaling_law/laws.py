@@ -14,54 +14,124 @@ _EPS = 1e-12
 # theta: [c0, cN, alpha, cS, beta, cNS]
 def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     c0, cN, alpha, cS, beta, cNS = [theta[:, i] for i in range(6)]
-    Na = N[None, :] ** (-alpha[:, None])
-    Sb = S[None, :] ** (-beta[:, None])
-    pred = c0[:, None] + cN[:, None] * Na + cS[:, None] * Sb + cNS[:, None] * Na * Sb
-    return pred[0] if pred.shape[0] == 1 else pred
+    Na = N[None, :] ** (-alpha[:, None])   # (B, M)
+    Sb = S[None, :] ** (-beta[:, None])    # (B, M)
+    NaSb = Na * Sb
+    pred = c0[:, None] + cN[:, None] * Na + cS[:, None] * Sb + cNS[:, None] * NaSb
+
+    # Jacobian: d/d[c0, cN, alpha, cS, beta, cNS]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))  # (1, M) or (B, M) after broadcast
+    logS = xp.log(ops.clamp_min(S[None, :], _EPS))
+
+    d_c0 = ones
+    d_cN = Na
+    # d(Na)/d(alpha) = d(N^(-alpha))/d(alpha) = -N^(-alpha)*log(N) = -Na*logN
+    d_alpha = (cN[:, None] * Na + cNS[:, None] * NaSb) * (-logN)
+    d_cS = Sb
+    # d(Sb)/d(beta) = -Sb*logS
+    d_beta = (cS[:, None] * Sb + cNS[:, None] * NaSb) * (-logS)
+    d_cNS = NaSb
+    jac = ops.stack([d_c0, d_cN, d_alpha, d_cS, d_beta, d_cNS], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_2 (5p): c0 + cN * N^(-α) + cS * S^(-β)
 # theta: [c0, cN, alpha, cS, beta]
 def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     c0, cN, alpha, cS, beta = [theta[:, i] for i in range(5)]
-    pred = c0[:, None] + cN[:, None] * (N[None, :] ** (-alpha[:, None])) + cS[:, None] * (S[None, :] ** (-beta[:, None]))
-    return pred[0] if pred.shape[0] == 1 else pred
+    Na = N[None, :] ** (-alpha[:, None])
+    Sb = S[None, :] ** (-beta[:, None])
+    pred = c0[:, None] + cN[:, None] * Na + cS[:, None] * Sb
+
+    # Jacobian: d/d[c0, cN, alpha, cS, beta]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+    logS = xp.log(ops.clamp_min(S[None, :], _EPS))
+
+    d_c0 = ones
+    d_cN = Na
+    d_alpha = cN[:, None] * Na * (-logN)
+    d_cS = Sb
+    d_beta = cS[:, None] * Sb * (-logS)
+    jac = ops.stack([d_c0, d_cN, d_alpha, d_cS, d_beta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_3 (4p): a * N^b + c / (1 + S) + d
 # theta: [a, b, c, d]
 def sl_3(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     a, b, c, d = [theta[:, i] for i in range(4)]
-    pred = a[:, None] * (N[None, :] ** b[:, None]) + c[:, None] / (1.0 + S[None, :]) + d[:, None]
-    return pred[0] if pred.shape[0] == 1 else pred
+    Nb = N[None, :] ** b[:, None]
+    inv_1pS = 1.0 / (1.0 + S[None, :])
+    pred = a[:, None] * Nb + c[:, None] * inv_1pS + d[:, None]
+
+    # Jacobian: d/d[a, b, c, d]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+
+    d_a = Nb
+    d_b = a[:, None] * Nb * logN
+    d_c = inv_1pS + ones * 0.0  # broadcast
+    d_d = ones
+    jac = ops.stack([d_a, d_b, d_c, d_d], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_4 (4p): a * N^b + c * S^(-0.5) + d  (fixed beta=0.5)
 # theta: [a, b, c, d]
 def sl_4(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     a, b, c, d = [theta[:, i] for i in range(4)]
-    pred = a[:, None] * (N[None, :] ** b[:, None]) + c[:, None] * (S[None, :] ** (-0.5)) + d[:, None]
-    return pred[0] if pred.shape[0] == 1 else pred
+    Nb = N[None, :] ** b[:, None]
+    S_inv_half = S[None, :] ** (-0.5)
+    pred = a[:, None] * Nb + c[:, None] * S_inv_half + d[:, None]
+
+    # Jacobian: d/d[a, b, c, d]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+
+    d_a = Nb
+    d_b = a[:, None] * Nb * logN
+    d_c = S_inv_half + ones * 0.0  # broadcast
+    d_d = ones
+    jac = ops.stack([d_a, d_b, d_c, d_d], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_5 (4p): (A / (N * (k * log(S) + 1)))^α + E
@@ -74,25 +144,79 @@ def sl_5(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], 1.0)
     A, k, alpha, E = [theta[:, i] for i in range(4)]
-    denom = N[None, :] * (k[:, None] * xp.log(S[None, :]) + 1.0)
+    logS = xp.log(S[None, :])
+    denom = N[None, :] * (k[:, None] * logS + 1.0)
     denom = ops.clamp_min(denom, _EPS)
     base = A[:, None] / denom
     base = ops.clamp_min(base, _EPS)
-    pred = base ** alpha[:, None] + E[:, None]
-    return pred[0] if pred.shape[0] == 1 else pred
+    power = base ** alpha[:, None]  # base^alpha
+    pred = power + E[:, None]
+
+    # Jacobian: d/d[A, k, alpha, E]
+    # Let f = base^alpha, pred = f + E
+    # base = A / denom, denom = N*(k*logS + 1)
+    ones = pred * 0.0 + 1.0
+    log_base = xp.log(ops.clamp_min(base, _EPS))
+
+    # d(pred)/dA: d(base^alpha)/dA = alpha * base^(alpha-1) * (1/denom)
+    #           = alpha * base^alpha * (1/base) * (1/denom) = alpha * power / A[:, None]
+    # But safer: alpha * power * (1/base) * d(base)/dA = alpha * power / base * (1/denom)
+    #          = alpha * power / (A/denom) * (1/denom) = alpha * power / A
+    d_A = alpha[:, None] * power / ops.clamp_min(A[:, None], _EPS)
+
+    # d(pred)/dk: d(base^alpha)/dk = alpha * base^(alpha-1) * d(base)/dk
+    # d(base)/dk = A * d(1/denom)/dk = -A * logS * N / denom^2 = -base * logS * N / denom
+    # Actually: d(base)/dk = -A * N * logS / denom^2 = -(A/denom) * (N*logS)/denom = -base * logS / (k*logS+1)
+    # Simpler: d(base)/dk = -A * N * logS / denom^2
+    # So d(f)/dk = alpha * power / base * (-A * N * logS / denom^2)
+    #            = alpha * power * (-N * logS / denom) / base ... hmm
+    # Let's use: d(log(base))/dk = d(log(A) - log(denom))/dk = -d(log(denom))/dk
+    # d(log(denom))/dk = N*logS / denom ... but denom = N*(k*logS+1)
+    # d(denom)/dk = N*logS, so d(log(denom))/dk = N*logS/denom = logS/(k*logS+1)
+    # d(f)/dk = f * alpha * d(log(base))/dk = -power * alpha * logS / (k[:, None] * logS + 1.0)
+    k_logS_1 = ops.clamp_min(k[:, None] * logS + 1.0, _EPS)
+    d_k = -power * alpha[:, None] * logS / k_logS_1
+
+    # d(pred)/dalpha: d(base^alpha)/dalpha = base^alpha * log(base) = power * log(base)
+    d_alpha = power * log_base
+
+    d_E = ones
+    jac = ops.stack([d_A, d_k, d_alpha, d_E], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_6 (4p): c0 + c1 * (N^(-α) + S^(-β))
 # theta: [c0, c1, alpha, beta]
 def sl_6(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     c0, c1, alpha, beta = [theta[:, i] for i in range(4)]
-    pred = c0[:, None] + c1[:, None] * (N[None, :] ** (-alpha[:, None]) + S[None, :] ** (-beta[:, None]))
-    return pred[0] if pred.shape[0] == 1 else pred
+    Na = N[None, :] ** (-alpha[:, None])
+    Sb = S[None, :] ** (-beta[:, None])
+    sumNS = Na + Sb
+    pred = c0[:, None] + c1[:, None] * sumNS
+
+    # Jacobian: d/d[c0, c1, alpha, beta]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+    logS = xp.log(ops.clamp_min(S[None, :], _EPS))
+
+    d_c0 = ones
+    d_c1 = sumNS
+    d_alpha = c1[:, None] * Na * (-logN)
+    d_beta = c1[:, None] * Sb * (-logS)
+    jac = ops.stack([d_c0, d_c1, d_alpha, d_beta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_7 (4p): L0 + A * N^(-α) / (1 + k * ln(S))
@@ -105,11 +229,29 @@ def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], 1.0)
     L0, A, alpha, k = [theta[:, i] for i in range(4)]
-    numer = A[:, None] * (N[None, :] ** (-alpha[:, None]))
-    denom = 1.0 + k[:, None] * xp.log(S[None, :])
+    Na = N[None, :] ** (-alpha[:, None])
+    logS = xp.log(S[None, :])
+    denom = 1.0 + k[:, None] * logS
     denom = ops.clamp_min(denom, _EPS)
-    pred = L0[:, None] + numer / denom
-    return pred[0] if pred.shape[0] == 1 else pred
+    numer = A[:, None] * Na
+    frac = numer / denom
+    pred = L0[:, None] + frac
+
+    # Jacobian: d/d[L0, A, alpha, k]
+    ones = pred * 0.0 + 1.0
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+
+    d_L0 = ones
+    d_A = Na / denom
+    # d(frac)/d(alpha) = A * d(Na)/d(alpha) / denom = A * (-Na*logN) / denom = -frac * logN
+    d_alpha = -frac * logN
+    # d(frac)/dk = -numer * logS / denom^2 = -frac * logS / denom
+    d_k = -frac * logS / denom
+    jac = ops.stack([d_L0, d_A, d_alpha, d_k], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_8 (4p): (a * N^b + c) / (1 + d * log(S))
@@ -122,37 +264,86 @@ def sl_8(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], 1.0)
     a, b, c, d = [theta[:, i] for i in range(4)]
-    numer = a[:, None] * (N[None, :] ** b[:, None]) + c[:, None]
-    denom = 1.0 + d[:, None] * xp.log(S[None, :])
+    Nb = N[None, :] ** b[:, None]
+    logS = xp.log(S[None, :])
+    numer = a[:, None] * Nb + c[:, None]
+    denom = 1.0 + d[:, None] * logS
     denom = ops.clamp_min(denom, _EPS)
     pred = numer / denom
-    return pred[0] if pred.shape[0] == 1 else pred
+
+    # Jacobian: d/d[a, b, c, d]
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+    inv_denom = 1.0 / denom
+
+    d_a = Nb * inv_denom                               # d(numer)/da = N^b
+    d_b = a[:, None] * Nb * logN * inv_denom            # d(numer)/db = a * N^b * logN
+    d_c = inv_denom                                     # d(numer)/dc = 1
+    d_d = -numer * logS * inv_denom ** 2                # d(denom)/dd = logS → quotient rule
+    jac = ops.stack([d_a, d_b, d_c, d_d], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_9 (3p): A * N^(-α) * S^(-β)
 # theta: [A, alpha, beta]
 def sl_9(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     A, alpha, beta = [theta[:, i] for i in range(3)]
-    pred = A[:, None] * (N[None, :] ** (-alpha[:, None])) * (S[None, :] ** (-beta[:, None]))
-    return pred[0] if pred.shape[0] == 1 else pred
+    Na = N[None, :] ** (-alpha[:, None])
+    Sb = S[None, :] ** (-beta[:, None])
+    pred = A[:, None] * Na * Sb
+
+    # Jacobian: d/d[A, alpha, beta]
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+    logS = xp.log(ops.clamp_min(S[None, :], _EPS))
+
+    d_A = Na * Sb                   # pred / A
+    d_alpha = pred * (-logN)        # d(N^(-alpha))/dalpha = -N^(-alpha)*logN
+    d_beta = pred * (-logS)
+    jac = ops.stack([d_A, d_alpha, d_beta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 # sl_10 (4p): (A * N^(-α) + E) * S^(-β)
 # theta: [A, alpha, E, beta]
 def sl_10(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     N = ops.clamp_min(X[:, 0], _EPS)
     S = ops.clamp_min(X[:, 1], _EPS)
     A, alpha, E, beta = [theta[:, i] for i in range(4)]
-    pred = (A[:, None] * (N[None, :] ** (-alpha[:, None])) + E[:, None]) * (S[None, :] ** (-beta[:, None]))
-    return pred[0] if pred.shape[0] == 1 else pred
+    Na = N[None, :] ** (-alpha[:, None])
+    Sb = S[None, :] ** (-beta[:, None])
+    bracket = A[:, None] * Na + E[:, None]  # (A*N^(-alpha) + E)
+    pred = bracket * Sb
+
+    # Jacobian: d/d[A, alpha, E, beta]
+    logN = xp.log(ops.clamp_min(N[None, :], _EPS))
+    logS = xp.log(ops.clamp_min(S[None, :], _EPS))
+
+    d_A = Na * Sb
+    # d(bracket)/dalpha = A * (-Na * logN), then * Sb
+    d_alpha = A[:, None] * Na * (-logN) * Sb
+    d_E = Sb
+    # d(pred)/dbeta = bracket * d(Sb)/dbeta = bracket * (-Sb * logS) = -pred * logS
+    d_beta = -pred * logS
+    jac = ops.stack([d_A, d_alpha, d_E, d_beta], axis=-1)
+
+    if pred.shape[0] == 1:
+        return pred[0], jac[0]
+    return pred, jac
 
 
 PARAM_BOUNDS = {

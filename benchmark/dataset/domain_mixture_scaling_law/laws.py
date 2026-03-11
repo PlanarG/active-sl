@@ -12,8 +12,18 @@ _EPS = 1e-12
 _NUM_DOMAINS = 5
 
 
-def _squeeze(pred, B):
-    return pred[0] if B == 1 else pred
+def _squeeze(pred, jac, B):
+    if B == 1:
+        return pred[0], jac[0]
+    return pred, jac
+
+
+def _assign(arr, backend, idx, val):
+    """Assign val to arr at index idx, handling jax immutability."""
+    if backend == "jax":
+        return arr.at[idx].set(val)
+    arr[idx] = val
+    return arr
 
 
 # sl_1 (30p): loss_i = a_i + b_i*log(p_i+eps) + sum_{j!=i} c_{ij}*p_j
@@ -24,28 +34,38 @@ def sl_1(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 30
     if backend == "torch":
         out = xp.zeros((B, M, _NUM_DOMAINS), dtype=xp.float64)
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P), dtype=xp.float64)
     else:
         out = xp.zeros((B, M, _NUM_DOMAINS))
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         a_i = theta[:, offset]
         b_i = theta[:, offset + 1]
         c_ij = theta[:, offset + 2: offset + 6]
-        offset += 6
         p_i = ops.clamp_min(X[:, i], _EPS)
-        val = a_i[:, None] + b_i[:, None] * xp.log(p_i)[None, :]
+        log_pi = xp.log(p_i)  # (M,)
+        val = a_i[:, None] + b_i[:, None] * log_pi[None, :]
         j_indices = [j for j in range(_NUM_DOMAINS) if j != i]
         for k, j in enumerate(j_indices):
             val = val + c_ij[:, k:k+1] * X[None, :, j]
-        if backend == "torch":
-            out[:, :, i] = val
-        elif backend == "jax":
-            out = out.at[:, :, i].set(val)
-        else:
-            out[:, :, i] = val
-    return _squeeze(out, B)
+        out = _assign(out, backend, (slice(None), slice(None), i), val)
+        # Jacobian
+        # d/d a_i = 1
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset), ones_BM)
+        # d/d b_i = log(p_i)
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 1),
+                       log_pi[None, :] * ones_BM)
+        # d/d c_ij = p_j
+        for k, j in enumerate(j_indices):
+            jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 2 + k),
+                           X[None, :, j] * ones_BM)
+        offset += 6
+    return _squeeze(out, jac, B)
 
 
 # sl_2 (35p): loss_i = A_i*(p_i+eps_i)^(-alpha_i)*exp(sum_j w_{ij}*p_j)
@@ -56,32 +76,58 @@ def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 35
     if backend == "torch":
         out = xp.zeros((B, M, _NUM_DOMAINS), dtype=xp.float64)
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P), dtype=xp.float64)
     else:
         out = xp.zeros((B, M, _NUM_DOMAINS))
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P))
     offset = 0
     for i in range(_NUM_DOMAINS):
         A_i = theta[:, offset]
         eps_i = theta[:, offset + 1]
         alpha_i = theta[:, offset + 2]
         w_ij = theta[:, offset + 3: offset + 7]
-        offset += 7
-        p_i = ops.clamp_min(X[:, i] + eps_i[:, None], _EPS)
-        power_term = A_i[:, None] * (p_i ** (-alpha_i[:, None]))
+        p_i = ops.clamp_min(X[:, i] + eps_i[:, None], _EPS)  # (B, M)
+        power_term = A_i[:, None] * (p_i ** (-alpha_i[:, None]))  # (B, M)
         j_indices = [j for j in range(_NUM_DOMAINS) if j != i]
         interaction = xp.zeros((B, M)) if backend != "torch" else xp.zeros((B, M), dtype=xp.float64)
         for k, j in enumerate(j_indices):
             interaction = interaction + w_ij[:, k:k+1] * X[None, :, j]
         interaction = ops.clamp(interaction, min=-20.0, max=20.0)
-        val = power_term * ops.exp(interaction)
-        if backend == "torch":
-            out[:, :, i] = val
-        elif backend == "jax":
-            out = out.at[:, :, i].set(val)
-        else:
-            out[:, :, i] = val
-    return _squeeze(out, B)
+        exp_inter = ops.exp(interaction)  # (B, M)
+        val = power_term * exp_inter  # (B, M)
+        out = _assign(out, backend, (slice(None), slice(None), i), val)
+
+        # Jacobian: val = A_i * (p_i+eps_i)^(-alpha_i) * exp(interaction)
+        # Let f = val
+        # d/d A_i = f / A_i = (p_i)^(-alpha_i) * exp(interaction)
+        d_A = val / ops.clamp_min(xp.abs(A_i[:, None]), _EPS)
+        # More robustly: d_A = (p_i ** (-alpha_i)) * exp_inter
+        d_A = (p_i ** (-alpha_i[:, None])) * exp_inter
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset), d_A)
+
+        # d/d eps_i: chain through p_i = X[:,i] + eps_i
+        # d(val)/d(eps_i) = A_i * (-alpha_i) * p_i^(-alpha_i - 1) * 1 * exp(inter)
+        #                  = val * (-alpha_i) / p_i
+        d_eps = val * (-alpha_i[:, None]) / p_i
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 1), d_eps)
+
+        # d/d alpha_i: d/d(alpha) of p_i^(-alpha) = -log(p_i) * p_i^(-alpha)
+        # d(val)/d(alpha_i) = A_i * (-log(p_i)) * p_i^(-alpha_i) * exp(inter)
+        #                   = val * (-log(p_i))
+        log_pi = xp.log(ops.clamp_min(p_i, _EPS))
+        d_alpha = val * (-log_pi)
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 2), d_alpha)
+
+        # d/d w_ij[k]: d(val)/d(w_k) = val * p_j  (from exp derivative)
+        for k, j in enumerate(j_indices):
+            d_w = val * X[None, :, j]
+            jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 3 + k), d_w)
+
+        offset += 7
+    return _squeeze(out, jac, B)
 
 
 # sl_3 (35p): loss_i = base_i + coeff_i*p_i^exp_i + sum_{j!=i} W_{ij}*p_j
@@ -89,30 +135,52 @@ def sl_2(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
 # Repack: per domain i: base(1)+coeff(1)+exp(1)+W_{ij}(4)=7 -> 35
 def sl_3(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 35
     if backend == "torch":
-        import torch; out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        import torch
+        out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        jac = torch.zeros((B, M, _NUM_DOMAINS, P), dtype=torch.float64)
     else:
-        import numpy as np; out = np.zeros((B, M, _NUM_DOMAINS))
+        import numpy as np
+        out = np.zeros((B, M, _NUM_DOMAINS))
+        jac = np.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         base_i = theta[:, offset]
         coeff_i = theta[:, offset + 1]
         exp_i = theta[:, offset + 2]
         W_ij = theta[:, offset + 3: offset + 7]
-        offset += 7
         p_i = ops.clamp_min(X[:, i], _EPS)
-        val = base_i[:, None] + coeff_i[:, None] * (p_i[None, :] ** exp_i[:, None])
+        p_i_pow = p_i[None, :] ** exp_i[:, None]  # (B, M)
+        val = base_i[:, None] + coeff_i[:, None] * p_i_pow
         j_indices = [j for j in range(_NUM_DOMAINS) if j != i]
         for k, j in enumerate(j_indices):
             val = val + W_ij[:, k:k+1] * X[None, :, j]
         out[:, :, i] = val
+
+        # Jacobian
+        # d/d base_i = 1
+        jac[:, :, i, offset] = ones_BM
+        # d/d coeff_i = p_i^exp_i
+        jac[:, :, i, offset + 1] = p_i_pow
+        # d/d exp_i = coeff_i * p_i^exp_i * log(p_i)
+        log_pi = xp.log(ops.clamp_min(p_i, _EPS))  # (M,)
+        jac[:, :, i, offset + 2] = coeff_i[:, None] * p_i_pow * log_pi[None, :]
+        # d/d W_ij[k] = p_j
+        for k, j in enumerate(j_indices):
+            jac[:, :, i, offset + 3 + k] = X[None, :, j] * ones_BM
+
+        offset += 7
     if backend == "jax":
         import jax.numpy as jnp
         out = jnp.array(out)
-    return _squeeze(out, B)
+        jac = jnp.array(jac)
+    return _squeeze(out, jac, B)
 
 
 # sl_4 (35p): loss_i = exp(sum_k C_{ik}*p_k^alpha_k + bias_i)
@@ -125,32 +193,61 @@ def sl_4(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 35
     # First 5 params: shared alpha exponents
     alphas = theta[:, :5]  # (B, 5)
     if backend == "torch":
         out = xp.zeros((B, M, _NUM_DOMAINS), dtype=xp.float64)
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P), dtype=xp.float64)
     else:
         out = xp.zeros((B, M, _NUM_DOMAINS))
-    # Power-transform: X_powered[None,:,k] = X[:,k]^alphas[:,k]
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P))
+
+    # Precompute p_k^alpha_k and log(p_k) for all k
+    p_pow = []   # list of (B, M) arrays: p_k^alpha_k
+    log_p = []   # list of (M,) arrays: log(p_k)
+    for k in range(_NUM_DOMAINS):
+        p_k = ops.clamp_min(X[:, k], _EPS)
+        lp_k = xp.log(ops.clamp_min(p_k, _EPS))
+        log_p.append(lp_k)
+        p_pow.append(p_k[None, :] ** alphas[:, k:k+1])  # (B, M)
+
     offset = 5
     for i in range(_NUM_DOMAINS):
         bias_i = theta[:, offset]
         C_ik = theta[:, offset + 1: offset + 6]  # (B, 5)
-        offset += 6
         # sum_k C_ik * p_k^alpha_k
         lin = bias_i[:, None]  # (B, 1) -> broadcast to (B, M)
         for k in range(_NUM_DOMAINS):
-            p_k = ops.clamp_min(X[:, k], _EPS)
-            lin = lin + C_ik[:, k:k+1] * (p_k[None, :] ** alphas[:, k:k+1])
+            lin = lin + C_ik[:, k:k+1] * p_pow[k]
         lin = ops.clamp(lin, min=-50.0, max=50.0)
-        val = ops.exp(lin)
-        if backend == "torch":
-            out[:, :, i] = val
-        elif backend == "jax":
-            out = out.at[:, :, i].set(val)
-        else:
-            out[:, :, i] = val
-    return _squeeze(out, B)
+        val = ops.exp(lin)  # (B, M)
+        out = _assign(out, backend, (slice(None), slice(None), i), val)
+
+        # Jacobian: val = exp(lin)
+        # d(val)/d(param) = val * d(lin)/d(param)
+
+        # d/d alpha_k (shared, index k in 0..4):
+        # d(lin)/d(alpha_k) = C_ik * p_k^alpha_k * log(p_k)
+        for k in range(_NUM_DOMAINS):
+            d_alpha_k = val * C_ik[:, k:k+1] * p_pow[k] * log_p[k][None, :]
+            # Accumulate into shared alpha slot (index k)
+            # Multiple domains contribute to same alpha_k, so we add
+            if backend == "jax":
+                jac = jac.at[:, :, i, k].set(d_alpha_k)
+            else:
+                jac[:, :, i, k] = d_alpha_k
+
+        # d/d bias_i = val * 1
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset), val)
+
+        # d/d C_ik = val * p_k^alpha_k
+        for k in range(_NUM_DOMAINS):
+            d_C = val * p_pow[k]
+            jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 1 + k), d_C)
+
+        offset += 6
+    return _squeeze(out, jac, B)
 
 
 # sl_5 (35p): loss_i = b_i + sum_j W_{ij} * p_j^alpha_j
@@ -158,71 +255,123 @@ def sl_4(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
 # 5 alpha + 5 bias + 25 W = 35
 def sl_5(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 35
     alphas = theta[:, :5]  # (B, 5)
     if backend == "torch":
-        import torch; out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        import torch
+        out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        jac = torch.zeros((B, M, _NUM_DOMAINS, P), dtype=torch.float64)
     else:
-        import numpy as np; out = np.zeros((B, M, _NUM_DOMAINS))
+        import numpy as np
+        out = np.zeros((B, M, _NUM_DOMAINS))
+        jac = np.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
+
+    # Precompute p_j^alpha_j and log(p_j) for all j
+    p_pow = []
+    log_p = []
+    for j in range(_NUM_DOMAINS):
+        p_j = ops.clamp_min(X[:, j], _EPS)
+        lp_j = xp.log(ops.clamp_min(p_j, _EPS))
+        log_p.append(lp_j)
+        p_pow.append(p_j[None, :] ** alphas[:, j:j+1])  # (B, M)
+
     offset = 5
     for i in range(_NUM_DOMAINS):
         b_i = theta[:, offset]
         W_ij = theta[:, offset + 1: offset + 6]  # (B, 5)
-        offset += 6
         val = b_i[:, None]
         for j in range(_NUM_DOMAINS):
-            p_j = ops.clamp_min(X[:, j], _EPS)
-            val = val + W_ij[:, j:j+1] * (p_j[None, :] ** alphas[:, j:j+1])
+            val = val + W_ij[:, j:j+1] * p_pow[j]
         out[:, :, i] = val
+
+        # Jacobian
+        # d/d alpha_j (shared, index j in 0..4):
+        # d(val)/d(alpha_j) = W_ij * p_j^alpha_j * log(p_j)
+        for j in range(_NUM_DOMAINS):
+            d_alpha = W_ij[:, j:j+1] * p_pow[j] * log_p[j][None, :]
+            jac[:, :, i, j] = d_alpha
+
+        # d/d b_i = 1
+        jac[:, :, i, offset] = ones_BM
+
+        # d/d W_ij = p_j^alpha_j
+        for j in range(_NUM_DOMAINS):
+            jac[:, :, i, offset + 1 + j] = p_pow[j]
+
+        offset += 6
     if backend == "jax":
-        import jax.numpy as jnp; out = jnp.array(out)
-    return _squeeze(out, B)
+        import jax.numpy as jnp
+        out = jnp.array(out)
+        jac = jnp.array(jac)
+    return _squeeze(out, jac, B)
 
 
 # sl_6 (35p): loss_i = C_i + A_i * (sum_j T_{ij}*p_j)^(-alpha_i)
 # Effective-mixture power law
-# Per domain: C(1)+A(1)+alpha(1)+T(5)=8... but 8*5=40. Use T(4 cross-domain only)=7 -> 35
-# Actually: per domain: C(1)+A(1)+alpha(1)+T(4 cross)=7 -> 35
-# Use all 5 T weights: C(1)+A(1)+alpha(1)+T(4)=7 -> 35
+# Per domain: C(1)+A(1)+alpha(1)+T(4 cross)=7 -> 35
 def sl_6(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 35
     if backend == "torch":
-        import torch; out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        import torch
+        out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        jac = torch.zeros((B, M, _NUM_DOMAINS, P), dtype=torch.float64)
     else:
-        import numpy as np; out = np.zeros((B, M, _NUM_DOMAINS))
+        import numpy as np
+        out = np.zeros((B, M, _NUM_DOMAINS))
+        jac = np.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         C_i = theta[:, offset]
         A_i = theta[:, offset + 1]
         alpha_i = theta[:, offset + 2]
-        # T weights for all 5 domains (4 cross + self = use all proportions)
         T_ij = theta[:, offset + 3: offset + 7]  # 4 weights for j!=i
-        offset += 7
-        # Compute effective mixture: T_{i,self}*p_i + sum_{j!=i} T_{ij}*p_j
-        # We use self proportion directly + 4 cross weights
-        eff = X[None, :, i]  # self proportion, unweighted
+        # eff = p_i + sum_{j!=i} T_ij * p_j
+        eff = X[None, :, i]  # (1, M) or (B, M) after broadcast
         j_indices = [j for j in range(_NUM_DOMAINS) if j != i]
         for k, j in enumerate(j_indices):
             eff = eff + T_ij[:, k:k+1] * X[None, :, j]
-        eff = ops.clamp_min(eff, _EPS)
-        val = C_i[:, None] + A_i[:, None] * (eff ** (-alpha_i[:, None]))
+        eff = ops.clamp_min(eff, _EPS)  # (B, M)
+        eff_pow = eff ** (-alpha_i[:, None])  # (B, M)
+        val = C_i[:, None] + A_i[:, None] * eff_pow
         out[:, :, i] = val
+
+        # Jacobian
+        # power_term = A_i * eff^(-alpha_i)
+        power_term = A_i[:, None] * eff_pow  # (B, M)
+        log_eff = xp.log(ops.clamp_min(eff, _EPS))
+
+        # d/d C_i = 1
+        jac[:, :, i, offset] = ones_BM
+        # d/d A_i = eff^(-alpha_i)
+        jac[:, :, i, offset + 1] = eff_pow
+        # d/d alpha_i = A_i * eff^(-alpha_i) * (-log(eff)) = power_term * (-log(eff))
+        jac[:, :, i, offset + 2] = power_term * (-log_eff)
+        # d/d T_ij[k] = A_i * (-alpha_i) * eff^(-alpha_i - 1) * p_j
+        #             = power_term * (-alpha_i) / eff * p_j
+        for k, j in enumerate(j_indices):
+            d_T = power_term * (-alpha_i[:, None]) / eff * X[None, :, j]
+            jac[:, :, i, offset + 3 + k] = d_T
+
+        offset += 7
     if backend == "jax":
-        import jax.numpy as jnp; out = jnp.array(out)
-    return _squeeze(out, B)
+        import jax.numpy as jnp
+        out = jnp.array(out)
+        jac = jnp.array(jac)
+    return _squeeze(out, jac, B)
 
 
 # sl_7 (40p): loss_i = intercept_i + sum_j (c_lin_{ij}*p_j + c_log_{ij}*log(p_j+eps))
-# Full linear-and-log matrix
-# Per domain: intercept(1) + c_lin(5) + c_log(5) - but c_log_{ii} merged, keep separate
-# -> 1+5+5 = 11 per domain? Too many. Use 8 per domain: intercept(1)+c_lin(4 cross)+c_log_self(1)+c_log(2 cross)=8 -> 40
-# Simpler: per domain 8p: intercept(1) + linear_self(1) + log_self(1) + cross_linear(4) + cross_log(1 shared) = 8 -> 40
-# Actually let's do it properly: per domain i: intercept(1) + 4 cross_lin + 1 self_lin + 1 self_log + 1 self_quad_log = 8 -> 40
 # Simplest: per domain 8p total -> 40. Use: a_i + b_i*p_i + c_i*log(p_i) + sum_{j!=i}(d_{ij}*p_j + e_i*log(p_j))
 # Per domain: a(1)+b(1)+c(1)+d(4)+e(1)=8 -> 40
 def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
@@ -231,10 +380,14 @@ def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 40
     if backend == "torch":
         out = xp.zeros((B, M, _NUM_DOMAINS), dtype=xp.float64)
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P), dtype=xp.float64)
     else:
         out = xp.zeros((B, M, _NUM_DOMAINS))
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         a_i = theta[:, offset]
@@ -242,20 +395,37 @@ def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
         c_i = theta[:, offset + 2]
         d_ij = theta[:, offset + 3: offset + 7]  # 4 cross-domain linear
         e_i = theta[:, offset + 7]  # shared cross-domain log coeff
-        offset += 8
         p_i = ops.clamp_min(X[:, i], _EPS)
-        val = a_i[:, None] + b_i[:, None] * X[None, :, i] + c_i[:, None] * xp.log(p_i)[None, :]
+        log_pi = xp.log(p_i)  # (M,)
+        val = a_i[:, None] + b_i[:, None] * X[None, :, i] + c_i[:, None] * log_pi[None, :]
         j_indices = [j for j in range(_NUM_DOMAINS) if j != i]
+        # Accumulate sum of log(p_j) for d/d e_i
+        sum_log_pj = xp.zeros((M,)) if backend != "torch" else xp.zeros((M,), dtype=xp.float64)
         for k, j in enumerate(j_indices):
             p_j = ops.clamp_min(X[:, j], _EPS)
-            val = val + d_ij[:, k:k+1] * X[None, :, j] + e_i[:, None] * xp.log(p_j)[None, :]
-        if backend == "torch":
-            out[:, :, i] = val
-        elif backend == "jax":
-            out = out.at[:, :, i].set(val)
-        else:
-            out[:, :, i] = val
-    return _squeeze(out, B)
+            log_pj = xp.log(p_j)  # (M,)
+            val = val + d_ij[:, k:k+1] * X[None, :, j] + e_i[:, None] * log_pj[None, :]
+            sum_log_pj = sum_log_pj + log_pj
+        out = _assign(out, backend, (slice(None), slice(None), i), val)
+
+        # Jacobian
+        # d/d a_i = 1
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset), ones_BM)
+        # d/d b_i = p_i (the raw X value, not clamped -- actually it uses X[None,:,i])
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 1),
+                       X[None, :, i] * ones_BM)
+        # d/d c_i = log(p_i)
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 2),
+                       log_pi[None, :] * ones_BM)
+        # d/d d_ij[k] = p_j
+        for k, j in enumerate(j_indices):
+            jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 3 + k),
+                           X[None, :, j] * ones_BM)
+        # d/d e_i = sum_{j!=i} log(p_j)
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 7),
+                       sum_log_pj[None, :] * ones_BM)
+        offset += 8
+    return _squeeze(out, jac, B)
 
 
 # sl_8 (15p): loss_i = c_i - a_i * p_i^b_i
@@ -263,25 +433,45 @@ def sl_7(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
 # Per domain: 3p -> 15
 def sl_8(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 15
     if backend == "torch":
-        import torch; out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        import torch
+        out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        jac = torch.zeros((B, M, _NUM_DOMAINS, P), dtype=torch.float64)
     else:
-        import numpy as np; out = np.zeros((B, M, _NUM_DOMAINS))
+        import numpy as np
+        out = np.zeros((B, M, _NUM_DOMAINS))
+        jac = np.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         c_i = theta[:, offset]
         a_i = theta[:, offset + 1]
         b_i = theta[:, offset + 2]
-        offset += 3
         p_i = ops.clamp_min(X[:, i], _EPS)
-        val = c_i[:, None] - a_i[:, None] * (p_i[None, :] ** b_i[:, None])
+        log_pi = xp.log(ops.clamp_min(p_i, _EPS))  # (M,)
+        p_i_pow = p_i[None, :] ** b_i[:, None]  # (B, M)
+        val = c_i[:, None] - a_i[:, None] * p_i_pow
         out[:, :, i] = val
+
+        # Jacobian
+        # d/d c_i = 1
+        jac[:, :, i, offset] = ones_BM
+        # d/d a_i = -p_i^b_i
+        jac[:, :, i, offset + 1] = -p_i_pow
+        # d/d b_i = -a_i * p_i^b_i * log(p_i)
+        jac[:, :, i, offset + 2] = -a_i[:, None] * p_i_pow * log_pi[None, :]
+
+        offset += 3
     if backend == "jax":
-        import jax.numpy as jnp; out = jnp.array(out)
-    return _squeeze(out, B)
+        import jax.numpy as jnp
+        out = jnp.array(out)
+        jac = jnp.array(jac)
+    return _squeeze(out, jac, B)
 
 
 # sl_9 (15p): loss_i = a_i + b_i*log(p_i+eps) + c_i*[log(p_i+eps)]^2
@@ -293,26 +483,36 @@ def sl_9(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 15
     if backend == "torch":
         out = xp.zeros((B, M, _NUM_DOMAINS), dtype=xp.float64)
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P), dtype=xp.float64)
     else:
         out = xp.zeros((B, M, _NUM_DOMAINS))
+        jac = xp.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         a_i = theta[:, offset]
         b_i = theta[:, offset + 1]
         c_i = theta[:, offset + 2]
-        offset += 3
         p_i = ops.clamp_min(X[:, i], _EPS)
-        lp = xp.log(p_i)[None, :]
+        lp = xp.log(p_i)[None, :]  # (1, M)
         val = a_i[:, None] + b_i[:, None] * lp + c_i[:, None] * lp ** 2
-        if backend == "torch":
-            out[:, :, i] = val
-        elif backend == "jax":
-            out = out.at[:, :, i].set(val)
-        else:
-            out[:, :, i] = val
-    return _squeeze(out, B)
+        out = _assign(out, backend, (slice(None), slice(None), i), val)
+
+        # Jacobian
+        # d/d a_i = 1
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset), ones_BM)
+        # d/d b_i = log(p_i)
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 1),
+                       lp * ones_BM)
+        # d/d c_i = [log(p_i)]^2
+        jac = _assign(jac, backend, (slice(None), slice(None), i, offset + 2),
+                       (lp ** 2) * ones_BM)
+
+        offset += 3
+    return _squeeze(out, jac, B)
 
 
 # sl_10 (15p): loss_i = a_i + b_i / (p_i + eps_i)
@@ -320,27 +520,43 @@ def sl_9(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
 # Per domain: 3p -> 15
 def sl_10(theta, X, backend: Literal["numpy", "jax", "torch"] = "jax"):
     ops = utils.get_ops(backend)
+    xp = ops.xp
     X = ops.asarray(X, atleast_2d=True)
     theta = ops.asarray(theta, atleast_2d=True)
     B, M = theta.shape[0], X.shape[0]
+    P = 15
     if backend == "torch":
-        import torch; out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        import torch
+        out = torch.zeros((B, M, _NUM_DOMAINS), dtype=torch.float64)
+        jac = torch.zeros((B, M, _NUM_DOMAINS, P), dtype=torch.float64)
     else:
-        import numpy as np; out = np.zeros((B, M, _NUM_DOMAINS))
+        import numpy as np
+        out = np.zeros((B, M, _NUM_DOMAINS))
+        jac = np.zeros((B, M, _NUM_DOMAINS, P))
+    ones_BM = xp.ones((B, M)) if backend != "torch" else xp.ones((B, M), dtype=xp.float64)
     offset = 0
     for i in range(_NUM_DOMAINS):
         a_i = theta[:, offset]
         b_i = theta[:, offset + 1]
         eps_i = theta[:, offset + 2]
-        offset += 3
-        denom = ops.clamp_min(X[:, i] + eps_i[:, None], _EPS)
-        val = a_i[:, None] + b_i[:, None] / denom[None, :] if B > 1 else a_i[:, None] + b_i[:, None] / denom[None, :]
-        # Fix: eps_i is (B,), X[:,i] is (M,) -> need proper broadcasting
-        val = a_i[:, None] + b_i[:, None] / ops.clamp_min(X[None, :, i] + eps_i[:, None], _EPS)
+        denom = ops.clamp_min(X[None, :, i] + eps_i[:, None], _EPS)  # (B, M)
+        val = a_i[:, None] + b_i[:, None] / denom
         out[:, :, i] = val
+
+        # Jacobian
+        # d/d a_i = 1
+        jac[:, :, i, offset] = ones_BM
+        # d/d b_i = 1 / (p_i + eps_i)
+        jac[:, :, i, offset + 1] = 1.0 / denom
+        # d/d eps_i = -b_i / (p_i + eps_i)^2
+        jac[:, :, i, offset + 2] = -b_i[:, None] / (denom ** 2)
+
+        offset += 3
     if backend == "jax":
-        import jax.numpy as jnp; out = jnp.array(out)
-    return _squeeze(out, B)
+        import jax.numpy as jnp
+        out = jnp.array(out)
+        jac = jnp.array(jac)
+    return _squeeze(out, jac, B)
 
 
 PARAM_BOUNDS = {
