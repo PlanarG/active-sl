@@ -437,16 +437,17 @@ class GreedyCheapestMethod:
 # ── SLTunerMethod (wraps sltuner.Selector, batch=1, refit every step) ────────
 
 class SLTunerMethod:
-    """Wrap sltuner.Selector with batch=1 and re-fit after every selection."""
+    """Wrap sltuner.Selector with batch=1 (pilot) / 3 (adaptive), refit every step."""
 
-    def __init__(self, sigma2=1e-3, num_samples=1024, n_restarts=64, max_workers=16):
+    batch_adaptive = 3
+
+    def __init__(self, sigma2=1e-3, num_samples=1024, n_restarts=128, max_workers=16):
         self.sigma2 = sigma2
         self.num_samples = num_samples
         self.n_restarts = n_restarts
         self.max_workers = max_workers
 
-    def propose(self, state: SelectionState) -> np.ndarray:
-        print("fuck ", state.current_theta, state.spent_budget / state.total_budget)
+    def propose(self, state: SelectionState, batch: int = 1) -> np.ndarray:
         ms = state.method_state
         aff_cand, aff_costs = _affordable_candidates(state)
         if len(aff_cand) == 0:
@@ -461,10 +462,18 @@ class SLTunerMethod:
         if state.current_theta is not None:
             theta_internal = self._to_internal(selector, state.current_theta)
 
-        idx = selector.select(theta=theta_internal, batch=1)
+        actual_batch = min(batch, len(aff_cand))
+        # Don't cross pilot/adaptive boundary
+        if selector.pilot_indices is not None:
+            remaining_pilot = len(selector.pilot_indices) - len(selector.selected_indices)
+            if remaining_pilot > 0:
+                actual_batch = min(actual_batch, remaining_pilot)
+        result = selector.select(theta=theta_internal, batch=actual_batch)
 
-        selected = np.array([idx])
-        print("fuck2")
+        if actual_batch == 1:
+            selected = np.array([result])
+        else:
+            selected = np.asarray(result, dtype=int)
 
         # Re-fit immediately after every selection
         new_observed = np.concatenate(
@@ -474,7 +483,6 @@ class SLTunerMethod:
             theta = self._refit(state, ms["fitter"], new_observed)
             if theta is not None:
                 state.current_theta = theta
-            
 
         return selected
 
@@ -529,16 +537,27 @@ class SLTunerMethod:
         return internal
 
     def _refit(self, state, fitter, observed_indices):
+        ms = state.method_state
+        selector = ms["selector"]
+        parameters = selector.parameters
+
         X_obs = state.X_train[observed_indices]
         y_obs = state.y_train[observed_indices]
+
         theta0s = []
         if state.current_theta is not None:
             theta0s.append(state.current_theta.copy())
-        lo = np.array([b[0] for b in state.param_bounds], dtype=np.float64)
-        hi = np.array([b[1] for b in state.param_bounds], dtype=np.float64)
-        n_random = max(self.n_restarts - 1, 1)
+
+        # Sample starting points uniformly in internal space, convert to external
+        n_random = max(self.n_restarts - len(theta0s), 1)
+        internal_lo = np.array([p.internal_bounds()[0] for p in parameters])
+        internal_hi = np.array([p.internal_bounds()[1] for p in parameters])
         for _ in range(n_random):
-            theta0s.append(lo + (hi - lo) * state.rng.random(state.n_params))
+            internal = internal_lo + (internal_hi - internal_lo) * state.rng.random(state.n_params)
+            external = np.array([p.to_external(internal[j])
+                                 for j, p in enumerate(parameters)])
+            theta0s.append(external)
+
         try:
             return fitter.fit(
                 state.model_fn, X_obs, y_obs, state.n_params,

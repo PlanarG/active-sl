@@ -17,7 +17,7 @@ class ParameterSpec:
     low: float
     high: float
     transform: Transform | None = None
-    sample_method: SampleMethod = SampleMethod.UNIFORM
+    sample_method: SampleMethod = SampleMethod.GRID
 
     def _infer_transform(self) -> Transform:
         if self.low > 0 and self.high / self.low >= 100:

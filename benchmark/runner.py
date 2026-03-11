@@ -95,8 +95,14 @@ def run_single(
             target = checkpoint * state.total_budget
 
             # Selection phase
+            batch_adaptive = getattr(method, 'batch_adaptive', 1)
             while state.spent_budget < target - 1e-12 and len(state.candidate_indices) > 0:
-                selected = method.propose(state)
+                in_pilot = len(state.observed_indices) < task.n_params
+                batch = 1 if in_pilot else min(batch_adaptive, len(state.candidate_indices))
+                try:
+                    selected = method.propose(state, batch=batch)
+                except TypeError:
+                    selected = method.propose(state)
                 if len(selected) == 0:
                     break
                 for idx in selected:

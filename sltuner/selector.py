@@ -48,9 +48,9 @@ class Selector:
         rng: np.random.Generator = np.random.default_rng(),
         shortlist_size: int = 20,
         max_enumerated_subsets: int = 5000,
-        pilot_ridge_rel: float = 5e-2,
+        pilot_ridge_rel: float = 1e-8,
         local_ridge_rel: float = 1e-8,
-        trust_tol: float = 5e-2,
+        trust_tol: float = 0.1,
     ):
         self.parameters = parameters
         self.candidates = candidates
@@ -232,7 +232,7 @@ class Selector:
                 else:
                     residual = G
 
-                residual_sq = np.sum(residual * residual, axis=1)
+                residual_sq = np.linalg.norm(residual, axis=1)
                 mean_scores += residual_sq
 
             mean_scores /= max(num_theta_samples, 1)
@@ -307,8 +307,8 @@ class Selector:
         search_basis_directions_internal: np.ndarray,
         observed_points: np.ndarray,
         tol: float | None = None,
-        initial_step: float = 0.01,
-        max_doublings: int = 30,
+        initial_step: float = 1e-5,
+        max_doublings: int = 60,
     ) -> np.ndarray:
         """
         Estimate, for each search-basis direction, how far we can move before
@@ -359,6 +359,7 @@ class Selector:
             else:
                 step_limits[i] = step
 
+        print(step_limits)
         return step_limits
 
     def _build_posterior_cache(
