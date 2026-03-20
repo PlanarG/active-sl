@@ -9,7 +9,7 @@ from benchmark.metrics import r_squared, log_auc_r2
 from benchmark.method import SelectionState
 from benchmark.task import ScalingLawTask, GroupData
 
-BUDGET_CHECKPOINTS = np.logspace(np.log10(0.0001), np.log10(1.0), 10).tolist()
+BUDGET_CHECKPOINTS = [0.01, 0.05, 0.1]
 
 
 @dataclass
