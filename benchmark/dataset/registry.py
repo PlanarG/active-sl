@@ -123,7 +123,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
             "loss_domain_5",
         ],
         cost_fn=_cost_domain_mixture,
-        budget_checkpoints=[0.3, 0.5, 0.8],
+        budget_checkpoints=[0.2, 0.35, 0.5],
     ),
     "chinchilla_scaling_law": DatasetInfo(
         name="chinchilla_scaling_law",

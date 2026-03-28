@@ -148,10 +148,10 @@ def run_single(
 
             X_obs = gd.X_train[obs_idx]
             y_obs = gd.y_train[obs_idx]
-            n_random = max(fitter.n_restarts - 1, 1)
+            n_random = max(fitter.n_restarts, 1)
             theta0s = []
-            if state.current_theta is not None:
-                theta0s.append(state.current_theta.copy())
+            # if state.current_theta is not None:
+            #     theta0s.append(state.current_theta.copy())
             bounds = task.param_bounds
             lo = np.array([b[0] for b in bounds], dtype=np.float64)
             hi = np.array([b[1] for b in bounds], dtype=np.float64)
