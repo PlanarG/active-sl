@@ -9,7 +9,13 @@ from benchmark.metrics import r_squared, log_auc_r2
 from benchmark.method import SelectionState
 from benchmark.task import ScalingLawTask, GroupData
 
-BUDGET_CHECKPOINTS = [0.01, 0.05, 0.1]
+DEFAULT_BUDGET_CHECKPOINTS = [0.01, 0.05, 0.1]
+
+
+def get_checkpoints(task) -> list:
+    """Return per-task checkpoints if set, otherwise the default."""
+    cp = getattr(task, 'budget_checkpoints', None)
+    return cp if cp is not None else DEFAULT_BUDGET_CHECKPOINTS
 
 
 @dataclass
@@ -78,21 +84,33 @@ def run_single(
     fitter,
     seed: int,
 ) -> RunResult:
-    # Use different seed per group to avoid correlated randomness
     base_seed = seed * 100_000
     states = {}
     for i, gd in enumerate(task.groups):
         states[gd.group] = _init_state(gd, task, base_seed + i)
 
+    # Points proposed but not yet counted (would have exceeded the checkpoint budget)
+    pending: Dict[str, np.ndarray] = {gd.group: np.array([], dtype=int) for gd in task.groups}
+
     r2_at_checkpoints = {}
     checkpoint_r2_vals = []
 
-    for checkpoint in BUDGET_CHECKPOINTS:
+    checkpoints = get_checkpoints(task)
+
+    for checkpoint in checkpoints:
         group_thetas = {}
 
         for gd in task.groups:
             state = states[gd.group]
             target = checkpoint * state.total_budget
+
+            # Flush pending points carried over from the previous checkpoint
+            if len(pending[gd.group]) > 0:
+                pend = pending[gd.group]
+                for idx in pend:
+                    state.spent_budget += state.cost_per_point[idx]
+                state.observed_indices = np.concatenate([state.observed_indices, pend])
+                pending[gd.group] = np.array([], dtype=int)
 
             # Selection phase
             batch_adaptive = getattr(method, 'batch_adaptive', 1)
@@ -105,15 +123,27 @@ def run_single(
                     selected = method.propose(state)
                 if len(selected) == 0:
                     break
-                for idx in selected:
-                    state.spent_budget += state.cost_per_point[idx]
-                state.observed_indices = np.concatenate([state.observed_indices, selected])
+
+                # Always remove from candidates first
                 mask = np.isin(state.candidate_indices, selected, invert=True)
                 state.candidate_indices = state.candidate_indices[mask]
 
+                deferred = []
+                for idx in selected:
+                    point_cost = float(state.cost_per_point[idx])
+                    if state.spent_budget + point_cost > target + 1e-12:
+                        deferred.append(idx)
+                    else:
+                        state.spent_budget += point_cost
+                        state.observed_indices = np.concatenate([state.observed_indices, [idx]])
+
+                if deferred:
+                    pending[gd.group] = np.array(deferred, dtype=int)
+                    break
+
             # Fitting phase
             obs_idx = state.observed_indices.astype(int)
-            if len(obs_idx) < task.n_params:
+            if len(obs_idx) < 1:
                 continue
 
             X_obs = gd.X_train[obs_idx]
@@ -134,7 +164,7 @@ def run_single(
             state.current_theta = theta
             group_thetas[gd.group] = theta
 
-        # Global evaluation across all groups
+        # Evaluate strictly within budget
         r2_val = _evaluate_global(task, group_thetas)
         r2_at_checkpoints[checkpoint] = r2_val
         checkpoint_r2_vals.append(r2_val)

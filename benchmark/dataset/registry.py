@@ -15,6 +15,8 @@ class DatasetInfo:
     cost_fn: Optional[Callable[[dict], float]] = None
     # Extra columns needed for cost but not used as features
     cost_extra_cols: List[str] = field(default_factory=list)
+    # Per-dataset budget checkpoints (overrides runner default if set)
+    budget_checkpoints: Optional[List[float]] = None
 
 
 def _cost_data_constrained(row: dict) -> float:
@@ -90,6 +92,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         target_cols=["brier_score"],
         cost_fn=_cost_easy_question,
         cost_extra_cols=["flops"],
+        budget_checkpoints=[0.01, 0.05, 0.1]
     ),
     "vocab_scaling_law": DatasetInfo(
         name="vocab_scaling_law",
@@ -120,6 +123,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
             "loss_domain_5",
         ],
         cost_fn=_cost_domain_mixture,
+        budget_checkpoints=[0.3, 0.5, 0.8],
     ),
     "chinchilla_scaling_law": DatasetInfo(
         name="chinchilla_scaling_law",
@@ -151,6 +155,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         target_cols=["loss"],
         cost_fn=_cost_sparsity,
         cost_extra_cols=["N_dense", "D1", "D2"],
+        budget_checkpoints=[0.2, 0.35, 0.5]
     ),
 }
 

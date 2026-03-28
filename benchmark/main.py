@@ -16,13 +16,13 @@ import numpy as np
 from benchmark.task import load_tasks_for_dataset
 from benchmark.method import METHOD_REGISTRY
 from benchmark.fitter import FITTER_REGISTRY
-from benchmark.runner import run_repeat, BUDGET_CHECKPOINTS
+from benchmark.runner import run_repeat, get_checkpoints
 
 
-def _aggregate_results(run_results: list) -> dict:
+def _aggregate_results(run_results: list, checkpoints: list) -> dict:
     """Aggregate RunResults for the same task across seeds into mean ± std."""
     task_id = run_results[0].task_id
-    fracs = BUDGET_CHECKPOINTS
+    fracs = checkpoints
 
     r2_matrix = np.array([
         [r.r2_at_checkpoints[f] for f in fracs] for r in run_results
@@ -41,7 +41,7 @@ def _aggregate_results(run_results: list) -> dict:
     }
 
 
-def _plot_results(task_id: str, run_results: list, output_dir: Path):
+def _plot_results(task_id: str, run_results: list, output_dir: Path, checkpoints: list):
     """Plot test R² vs budget: scatter all seeds, mean line, std shading."""
     import matplotlib
     matplotlib.use("Agg")
@@ -50,9 +50,9 @@ def _plot_results(task_id: str, run_results: list, output_dir: Path):
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    fracs = np.array(BUDGET_CHECKPOINTS)
+    fracs = np.array(checkpoints)
     r2_raw = np.array([
-        [r.r2_at_checkpoints[f] for f in BUDGET_CHECKPOINTS] for r in run_results
+        [r.r2_at_checkpoints[f] for f in checkpoints] for r in run_results
     ])
     r2_raw = np.where(np.isfinite(r2_raw), r2_raw, -1.0)
     n_seeds = r2_raw.shape[0]
@@ -165,13 +165,14 @@ def main():
     for task in tasks:
         print(f"Running {task.task_id} x{len(seeds)} seeds ...", file=sys.stderr)
         results = run_repeat(task, method, fitter, seeds)
-        agg = _aggregate_results(results)
+        cp = get_checkpoints(task)
+        agg = _aggregate_results(results, cp)
         aggregated.append(agg)
 
         # Persist results and plot after every task
         result_path.write_text(json.dumps(aggregated, indent=2) + "\n")
         if not args.no_plot:
-            _plot_results(task.task_id, results, output_dir)
+            _plot_results(task.task_id, results, output_dir, cp)
         print(f"  -> saved {task.task_id}", file=sys.stderr)
 
     print(f"Results saved to {result_path}", file=sys.stderr)

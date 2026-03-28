@@ -57,6 +57,7 @@ class ScalingLawTask:
     model_fn: Callable
     n_params: int
     param_bounds: Optional[List] = None
+    budget_checkpoints: Optional[List[float]] = None
 
 
 def _load_parquet(path: Path) -> dict:
@@ -149,6 +150,7 @@ def load_tasks_for_dataset(dataset_name: str) -> List[ScalingLawTask]:
             model_fn=_ModelFn(dataset_name, sl_id),
             n_params=n_p,
             param_bounds=bounds,
+            budget_checkpoints=info.budget_checkpoints,
         )
         tasks.append(task)
 

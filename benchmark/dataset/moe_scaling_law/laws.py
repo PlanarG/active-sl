@@ -579,7 +579,7 @@ PARAM_BOUNDS = {
     # Dataset: E ∈ {1,2,...,512}, log(E) ∈ [0,6.24]; N ∈ [1.65e7,1.31e9]; loss ∈ [2.0,3.16]
     # sl_1: [L_inf, B, alpha, beta] — L_inf + B / (N^alpha * E^beta)
     # Fit: L_inf≈1.55, B≈38, alpha≈0.19, beta≈0.07
-    "sl_1": [(0, 3), (0, 500), (0, 1.5), (-0.5, 1.5)],
+    "sl_1": [(0, 3), (0.1, 500), (0, 1.5), (-0.5, 1.5)],
     # sl_2: [L, K, alpha, beta, gamma] — L + K*(N^alpha * E^beta)^(-gamma)
     # Fit: L≈1.55, K≈38, alpha≈0.88, beta≈0.32, gamma≈0.22; alpha*gamma≈0.19, beta*gamma≈0.07
     "sl_2": [(0, 3), (0, 500), (0, 2), (0, 2), (0, 2)],
@@ -589,7 +589,7 @@ PARAM_BOUNDS = {
     "sl_3": [(0, 5e3), (-1.5, 0), (0, 20), (0, 2), (-1e4, 1e4), (-5, 5)],
     # sl_4: [a, alpha, b, gamma, c, d] — a/(N^alpha*(1+b*E)^gamma) + c + d*(logN-0.4*log(1+E))
     # Fit: a≈36, alpha≈0.19, b≈0.39, gamma≈0.12, c≈2.21, d≈-0.03
-    "sl_4": [(0, 500), (0, 1.5), (0, 20), (0, 1.5), (-5, 5), (-1, 1)],
+    "sl_4": [(0.1, 500), (0, 1.5), (0, 20), (0, 1.5), (-5, 5), (-1, 1)],
     # sl_5: [p0,p1,p2,p3,p4,p5] — p0 + exp(p1+p2*logE+p3*logN+p4*logE*logN) + p5*logE
     # Fit: p0≈1.59, p1≈3.80, p2≈-0.24, p3≈-0.20, p4≈0.013, p5≈-0.07
     # Exponent clamped to [-50,50] in model; p3*logN_max≈-0.2*21=-4.2 keeps p1<10 safe
