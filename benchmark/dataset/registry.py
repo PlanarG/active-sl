@@ -51,6 +51,10 @@ def _cost_chinchilla(row: dict) -> float:
     return 6.0 * float(row["N"]) * float(row["D"])
 
 
+def _cost_farseer(row: dict) -> float:
+    return 6.0 * float(row["N"]) * float(row["D"])
+
+
 def _cost_sft(row: dict) -> float:
     return float(row["sft_data_size"])
 
@@ -130,6 +134,12 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         feature_cols=["N", "D"],
         target_cols=["loss"],
         cost_fn=_cost_chinchilla,
+    ),
+    "farseer_scaling_law": DatasetInfo(
+        name="farseer_scaling_law",
+        feature_cols=["N", "D"],
+        target_cols=["loss"],
+        cost_fn=_cost_farseer,
     ),
     "sft_scaling_law": DatasetInfo(
         name="sft_scaling_law",

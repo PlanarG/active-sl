@@ -27,9 +27,14 @@ def _lbfgsb_one_start(x0, model_fn, X, y, bounds, maxiter, multi_output):
     """Run one L-BFGS-B restart. Returns (loss, theta) or (inf, None)."""
     def objective(theta_flat):
         theta_2d = theta_flat.reshape(1, -1)
-        pred = model_fn(theta_2d, X)[0]
+        pred, jac = model_fn(theta_2d, X)
         residuals = (pred - y).ravel() if multi_output else pred - y
-        return float(np.sum(residuals ** 2))
+        if multi_output:
+            jac_flat = jac.reshape(-1, jac.shape[-1])
+            grad = 2.0 * jac_flat.T @ residuals
+        else:
+            grad = 2.0 * jac.T @ residuals
+        return float(np.sum(residuals ** 2)), np.asarray(grad, dtype=np.float64)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -39,6 +44,7 @@ def _lbfgsb_one_start(x0, model_fn, X, y, bounds, maxiter, multi_output):
                 x0,
                 method="L-BFGS-B",
                 bounds=bounds,
+                jac=True,
                 options={"maxiter": maxiter, "ftol": 1e-15, "gtol": 1e-10},
             )
             return (res.fun, res.x.copy())
