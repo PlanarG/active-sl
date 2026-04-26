@@ -613,7 +613,7 @@ def run_one(seed, verbose=True):
               f"best_MSE={mses.min():.4e}, sig2={sigma2:.4e}")
 
     rep_thetas, weights, cov_infos = build_modes(
-        thetas_good, mses_good, X_sel, y_sel, X_train, sigma2, verbose=verbose)
+        thetas_good, mses_good, X_sel, y_sel, X_test, sigma2, verbose=verbose)
 
 
     warm_pool = [thetas[np.argmin(mses)].copy()]
@@ -671,7 +671,7 @@ def run_one(seed, verbose=True):
         if len(warm_pool) > 30:
             warm_pool = warm_pool[-30:]
 
-        good_mask = mses < (mses.min() + 1e-30) * 2
+        good_mask = mses < (mses.min() + 1e-30) * 1.5
         thetas_good = thetas[good_mask]
         mses_good = mses[good_mask]
 
