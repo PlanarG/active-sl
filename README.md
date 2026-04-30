@@ -9,6 +9,7 @@
 
 > Given a pool of runnable experiments and a **limited budget**, how should we select experiments to ensure that the **fitted scaling law extrapolates accurately** in the target region?
 
+[![arXiv](https://img.shields.io/badge/arXiv-2604.22753-b31b1b.svg)](https://arxiv.org/abs/2604.22753) [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-ScaleBench-blue)](https://huggingface.co/datasets/sijieli/scalebench) [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 This repository contains the core method and benchmark for **Spend Less, Fit Better: Budget-Efficient Scaling Law Fitting via Active Experiment Selection**. We formulate scaling-law fitting as a **budget-aware sequential design** problem: given a pool of candidate experiments with heterogeneous costs, select experiments sequentially to maximize extrapolation accuracy in a high-cost target region.
 
@@ -158,3 +159,13 @@ python mspe.py farseer_scaling_law 10
 - [`benchmark/dataset/`](benchmark/dataset): ScaleBench data and law definitions
 - [`mspe.py`](mspe.py): our method
 
+## Citation
+
+```
+@article{li2026spend,
+  title={Spend Less, Fit Better: Budget-Efficient Scaling Law Fitting via Active Experiment Selection},
+  author={Li, Sijie and Li, Shanda and Lin, Haowei and Sun, Weiwei and Talwalkar, Ameet and Yang, Yiming},
+  journal={arXiv preprint arXiv:2604.22753},
+  year={2026}
+}
+```
